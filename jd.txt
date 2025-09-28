@@ -1,0 +1,30 @@
+Responsibilities
+
+Apply machine learning, NLP, and deep learning methods to unstructured data sets and complex systems.
+Conduct individual and collaborative R and D initiatives centered around NLU, LLMs, with a special focus on LLM fine-tuning, security, explainability, and governance.
+Research and evaluate groundbreaking approaches to NLU and LLM-related problems.
+Develop new algorithms and methods for optimizing our existing LLM.
+Investigate and solve exciting and difficult challenges in machine learning, classification, data science, content analysis, and deep learning.
+Partner with Product and various platform teams to identify, highlight, and integrate new opportunities, ensuring the timely delivery of pivotal projects leveraging LLM, RAG, and AI/Generative AI technologies.
+Provide technical leadership and mentorship to mid/junior-level team members.
+
+Requirements
+
+BS/MS or PhD in AI or Natural Language Processing, mathematics, or a science field with a strong data/ML component; or equivalent related professional experience.
+Proven experience in NLP research, with a special focus on large language models (LLM).
+Hands-on experience with LLMs, fine-tuning, model safety, and security considerations.
+Ability to work closely with the product team to identify and implement differentiating features within LLM and RAG solutions to create unique and compelling product offerings.
+Ability to identify and implement emerging technologies in the AI/ML landscape.
+Experience in architecting, developing, and successfully deploying complex, large-scale ML/AI systems with a strong focus on model explainability, governance, and document search and retrieval.
+Knowledge of machine learning algorithms such as dimensionality reduction (PCA, SVD, UMAP, t-SNE), RNN/LSTM, convolutional neural networks, attention-based transformers, GANs, BERT, GPT-3 OpenAI, Hugging Face Transformers, and text generation models like T5 and XLNet.
+A strong aptitude for mathematics, particularly algebra and statistics.
+Experience with SciKit-Learn, Keras, PyTorch, and TensorFlow in building multilayer NNs, etc, and other ML libraries.
+Develop NLP / NLU modules using Spacy, Stanford NLP, Machine Learning, Huggingface, TensorRT, Distributed GPU Training, and Quantization.
+A team player who thrives when facing challenges.
+Experience architecting, developing, and successfully delivering complex, large-scale systems.
+
+This job was posted by Sakshi Parmar from yellow.ai (Formerly Yellow Messenger).
+
+
+Desired Skills and Experience
+Computer Vision,Generative AI,Machine Learning,NLP,R,Keras,PyTorch,Scikit-learn,spaCy,TensorFlow
