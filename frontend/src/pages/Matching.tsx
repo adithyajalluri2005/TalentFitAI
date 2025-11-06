@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Progress } from '@/components/ui/progress';
 import { 
   Target, 
   CheckCircle, 
@@ -23,7 +22,9 @@ export default function Matching() {
   }>({});
   const [isMatching, setIsMatching] = useState(false);
   const [matchResults, setMatchResults] = useState<CandidateState | null>(null);
-  
+  const [bestMatchTitle, setBestMatchTitle] = useState<string | null>(null);
+  const [matchScore, setMatchScore] = useState<number | null>(null);
+
   const { toast } = useToast();
   const navigate = useNavigate();
 
@@ -58,7 +59,7 @@ export default function Matching() {
           return;
         }
 
-        // If we already have match results, show them
+        // If already matched
         if (session.state?.match_score > 0) {
           setMatchResults(session.state);
         }
@@ -84,14 +85,16 @@ export default function Matching() {
     setIsMatching(true);
     
     try {
-      const response = await apiService.matchResumeWithJD({
+      // ✅ Use new matchAllJDs API
+      const response = await apiService.matchAllJDs({
         state: currentSession.state,
         thread_id: currentSession.threadId
       });
-      
+
       setMatchResults(response.state);
-      
-      // Update session in localStorage
+      setBestMatchTitle(response.best_match_title);
+      setMatchScore(response.match_score);
+
       const updatedSession = {
         threadId: response.thread_id,
         state: response.state,
@@ -102,10 +105,11 @@ export default function Matching() {
       
       toast({
         title: "Matching Complete",
-        description: `Match score: ${Math.round(response.match_score * 100)}%`,
+        description: `Best Match: ${response.best_match_title} (${Math.round(response.match_score)}%)`,
       });
       
     } catch (error) {
+      console.error(error);
       toast({
         title: "Matching Failed",
         description: "Failed to run candidate matching. Please try again.",
@@ -121,15 +125,15 @@ export default function Matching() {
   };
 
   const getMatchColor = (score: number) => {
-    if (score >= 0.8) return 'text-green-600';
-    if (score >= 0.6) return 'text-yellow-600';
+    if (score >= 80) return 'text-green-600';
+    if (score >= 60) return 'text-yellow-600';
     return 'text-red-600';
   };
 
   const getMatchLabel = (score: number) => {
-    if (score >= 0.8) return 'Excellent Match';
-    if (score >= 0.6) return 'Good Match';
-    if (score >= 0.4) return 'Fair Match';
+    if (score >= 80) return 'Excellent Match';
+    if (score >= 60) return 'Good Match';
+    if (score >= 40) return 'Fair Match';
     return 'Poor Match';
   };
 
@@ -137,7 +141,7 @@ export default function Matching() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-foreground">Candidate-Role Matching</h1>
+        <h1 className="text-2xl font-bold text-foreground">Candidate–JD Matching</h1>
         <p className="text-muted-foreground">
           Compare candidate skills with job requirements to calculate compatibility score
         </p>
@@ -204,7 +208,7 @@ export default function Matching() {
         </div>
       )}
 
-      {/* Matching Results or Action */}
+      {/* Matching Results */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -213,13 +217,13 @@ export default function Matching() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {!matchResults || matchResults.match_score === 0 ? (
+          {!matchResults || !matchScore ? (
             <div className="text-center py-8 space-y-4">
               <Target className="h-16 w-16 mx-auto text-muted-foreground" />
               <div>
                 <h3 className="text-lg font-semibold mb-2">Ready to Run Matching</h3>
                 <p className="text-muted-foreground mb-6">
-                  Analyze candidate skills against job requirements using AI-powered matching algorithms
+                  Analyze candidate skills against all job descriptions to find the best match
                 </p>
                 <Button 
                   onClick={runMatching} 
@@ -232,45 +236,25 @@ export default function Matching() {
             </div>
           ) : (
             <div className="space-y-6">
-              {/* Overall Match Score */}
+              {/* Best Match Title */}
+              {bestMatchTitle && (
+                <div className="text-center py-3 border-b">
+                  <p className="text-sm text-muted-foreground">Best Match</p>
+                  <h2 className="text-xl font-semibold text-indigo-600">{bestMatchTitle}</h2>
+                </div>
+              )}
+
+              {/* Match Score */}
               <div className="text-center py-6 border-b">
                 <div className="space-y-2">
                   <p className="text-sm text-muted-foreground">Overall Match Score</p>
-                  <div className={`text-4xl font-bold ${getMatchColor(matchResults.match_score)}`}>
-                    {Math.round(matchResults.match_score * 100)}%
+                  <div className={`text-4xl font-bold ${getMatchColor(matchScore)}`}>
+                    {Math.round(matchScore)}%
                   </div>
-                  <p className={`text-sm font-medium ${getMatchColor(matchResults.match_score)}`}>
-                    {getMatchLabel(matchResults.match_score)}
+                  <p className={`text-sm font-medium ${getMatchColor(matchScore)}`}>
+                    {getMatchLabel(matchScore)}
                   </p>
                 </div>
-              </div>
-
-              {/* Detailed Scores */}
-              <div className="grid gap-4 md:grid-cols-3">
-                <Card>
-                  <CardContent className="p-4 text-center">
-                    <p className="text-sm text-muted-foreground mb-1">TF-IDF Score</p>
-                    <p className="text-xl font-semibold">
-                      {Math.round(matchResults.tfidf_score * 100)}%
-                    </p>
-                  </CardContent>
-                </Card>
-                <Card>
-                  <CardContent className="p-4 text-center">
-                    <p className="text-sm text-muted-foreground mb-1">Semantic Score</p>
-                    <p className="text-xl font-semibold">
-                      {Math.round(matchResults.embedding_score * 100)}%
-                    </p>
-                  </CardContent>
-                </Card>
-                <Card>
-                  <CardContent className="p-4 text-center">
-                    <p className="text-sm text-muted-foreground mb-1">Keyword Score</p>
-                    <p className="text-xl font-semibold">
-                      {Math.round(matchResults.bow_score * 100)}%
-                    </p>
-                  </CardContent>
-                </Card>
               </div>
 
               {/* Matched Skills */}

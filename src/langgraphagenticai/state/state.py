@@ -57,6 +57,7 @@ class CandidateState(BaseModel):
     # === Interview ===
     interview_questions: List[InterviewQuestion] = Field(default_factory=list)
     candidate_answers: List[str] = Field(default_factory=list)
+    audio_transcripts: Dict[int, str] = {}
     interview_score: Optional[float] = None
     feedback: Optional[str] = None
 

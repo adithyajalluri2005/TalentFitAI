@@ -7,3 +7,6 @@ langchain_openai
 faiss-cpu
 streamlit
 tavily-python
+fastapi 
+uvicorn
+pydantic

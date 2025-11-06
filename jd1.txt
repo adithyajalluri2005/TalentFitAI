@@ -1,0 +1,25 @@
+About the job
+Company Description
+
+We are an innovative AI consulting company dedicated to developing cutting-edge AI solutions for our clients. Our services include creating custom chatbots, building and managing knowledge bases, and integrating advanced AI/ML solutions into existing products. Additionally, we develop full-stack mobile and web applications with AI/ML functionalities, including generative AI.
+
+Job Description
+
+Assist in the development and deployment of custom chatbots. 
+Support the creation and management of knowledge bases. 
+Collaborate on integrating AI/ML solutions into existing client products. 
+Participate in full-stack mobile and web application development projects. 
+Work on generative AI functionalities and contribute to the enhancement of existing AI solutions. 
+Conduct research and stay updated with the latest trends and technologies in AI/ML. 
+Provide support in testing and debugging AI/ML models and applications. 
+Proven experience in building and deploying agentic AI systems (e.g., autonomous AI agents, multi-agent frameworks, workflow orchestration) using frameworks such as LangChain, LlamaIndex, n8n, Retell, Vapi, or Vector Databases, with a focus on real-world applications and problem-solving. 
+Hands-on experience in developing, fine-tuning, and deploying generative AI models (LLMs, diffusion models, transformers) using frameworks like Hugging Face, OpenAI APIs, Stable Diffusion, or similar, with demonstrable projects in text, image, or multimodal generation. 
+
+Qualifications
+
+Strong understanding of machine learning algorithms and principles. 
+Proficiency in programming languages such as Python, JavaScript, or similar. 
+Familiarity with AI/ML frameworks and libraries (e.g., TensorFlow, PyTorch, scikit-learn, AutoGen). 
+Ability to work independently and as part of a team. 
+Excellent problem-solving skills and attention to detail. 
+Strong communication and collaboration skills.

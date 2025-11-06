@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Textarea } from '@/components/ui/textarea';
 import { Progress } from '@/components/ui/progress';
 import { 
   MessageCircle, 
@@ -10,13 +9,11 @@ import {
   Brain,
   CheckCircle,
   Mic,
-  MicOff,
   Video,
-  VideoOff,
-  Play,
-  Square
+  Square,
+  Loader2 
 } from 'lucide-react';
-import { apiService, CandidateState, InterviewQuestion } from '@/services/api';
+import { apiService, CandidateState } from '@/services/api';
 import { useToast } from '@/hooks/use-toast';
 import { useNavigate } from 'react-router-dom';
 
@@ -32,29 +29,27 @@ export default function InterviewQuestions() {
   const [currentAnswer, setCurrentAnswer] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [isVideoEnabled, setIsVideoEnabled] = useState(false);
-  const [transcript, setTranscript] = useState('');
-  
-  // Refs for media
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+
+  // ⏱ Timer states
+  const [timeLeft, setTimeLeft] = useState(15 * 60); // 15 minutes in seconds
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recognitionRef = useRef<any>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  
+
   const { toast } = useToast();
   const navigate = useNavigate();
 
   useEffect(() => {
     loadSessionFromStorage();
-    setupSpeechRecognition();
-    
-    // Cleanup on unmount
     return () => {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
+      if (timerRef.current) clearInterval(timerRef.current);
     };
   }, []);
 
@@ -64,11 +59,8 @@ export default function InterviewQuestions() {
       try {
         const session = JSON.parse(stored);
         setCurrentSession(session);
-
-        // If we already have interview data, show it
         if (session.state?.interview_questions && session.state.interview_questions.length > 0) {
           setInterviewData(session.state);
-          // Initialize answers array
           setAnswers(new Array(session.state.interview_questions.length).fill(''));
         }
       } catch (error) {
@@ -79,26 +71,20 @@ export default function InterviewQuestions() {
 
   const generateInterview = async () => {
     if (!currentSession.threadId || !currentSession.state) {
-      toast({
-        title: "Missing Information",
-        description: "Please complete the previous steps first",
-        variant: "destructive",
-      });
+      toast({ title: "Missing Information", description: "Please complete the previous steps first", variant: "destructive" });
       return;
     }
-    
+
     setIsGenerating(true);
-    
     try {
       const response = await apiService.generateInterview({
         state: currentSession.state,
         thread_id: currentSession.threadId
       });
-      
+
       setInterviewData(response.state);
       setAnswers(new Array(response.interview_questions.length).fill(''));
-      
-      // Update session in localStorage
+
       const updatedSession = {
         threadId: response.thread_id,
         state: response.state,
@@ -106,21 +92,40 @@ export default function InterviewQuestions() {
       };
       localStorage.setItem('talentai-session', JSON.stringify(updatedSession));
       setCurrentSession(updatedSession);
-      
-      toast({
-        title: "Interview Generated",
-        description: `Created ${response.interview_questions.length} interview questions`,
-      });
-      
+
+      toast({ title: "Interview Generated", description: `Created ${response.interview_questions.length} interview questions` });
+
+      // Start the timer when interview is generated
+      startTimer();
+
     } catch (error) {
-      toast({
-        title: "Generation Failed",
-        description: "Failed to generate interview questions. Please try again.",
-        variant: "destructive",
-      });
+      toast({ title: "Generation Failed", description: "Failed to generate interview questions. Please try again.", variant: "destructive" });
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  // ⏱ Timer function
+  const startTimer = useCallback(() => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    setTimeLeft(15 * 60);
+    timerRef.current = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(timerRef.current!);
+          toast({ title: "Time's Up!", description: "Interview auto-submitted after 15 minutes." });
+          submitInterview();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, []);
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
   const saveAnswer = () => {
@@ -128,87 +133,43 @@ export default function InterviewQuestions() {
     newAnswers[currentQuestionIndex] = currentAnswer;
     setAnswers(newAnswers);
     setCurrentAnswer('');
-    
-    toast({
-      title: "Answer Saved",
-      description: `Answer for question ${currentQuestionIndex + 1} saved`,
-    });
+    setRecordedBlob(null);
+    toast({ title: "Answer Saved", description: `Answer for question ${currentQuestionIndex + 1} saved` });
   };
 
   const nextQuestion = () => {
+    saveAnswer();
     if (currentQuestionIndex < (interviewData?.interview_questions.length || 0) - 1) {
       setCurrentQuestionIndex(prev => prev + 1);
       setCurrentAnswer(answers[currentQuestionIndex + 1] || '');
+      setRecordedBlob(null);
+      setIsTranscribing(false);
     }
   };
 
   const prevQuestion = () => {
+    saveAnswer();
     if (currentQuestionIndex > 0) {
       setCurrentQuestionIndex(prev => prev - 1);
       setCurrentAnswer(answers[currentQuestionIndex - 1] || '');
-    }
-  };
-
-  const setupSpeechRecognition = () => {
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = true;
-      recognitionRef.current.interimResults = true;
-      recognitionRef.current.lang = 'en-US';
-      
-      recognitionRef.current.onresult = (event) => {
-        let finalTranscript = '';
-        let interimTranscript = '';
-        
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript;
-          } else {
-            interimTranscript += transcript;
-          }
-        }
-        
-        const fullTranscript = finalTranscript + interimTranscript;
-        setTranscript(fullTranscript);
-        setCurrentAnswer(fullTranscript);
-      };
-      
-      recognitionRef.current.onerror = (event) => {
-        console.error('Speech recognition error:', event.error);
-        toast({
-          title: "Speech Recognition Error",
-          description: "There was an issue with speech recognition. Please try again.",
-          variant: "destructive",
-        });
-      };
+      setRecordedBlob(null);
+      setIsTranscribing(false);
     }
   };
 
   const startVideo = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: true, 
-        audio: true 
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       streamRef.current = stream;
-      
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
-      
       setIsVideoEnabled(true);
     } catch (error) {
-      toast({
-        title: "Camera Access Denied",
-        description: "Please allow camera access to record video responses.",
-        variant: "destructive",
-      });
+      toast({ title: "Camera/Mic Access Denied", description: "Please allow camera and microphone access to record responses.", variant: "destructive" });
     }
   };
 
-  // Auto-start camera when interview data is available
   useEffect(() => {
     if (interviewData && !isVideoEnabled) {
       startVideo();
@@ -226,109 +187,108 @@ export default function InterviewQuestions() {
 
   const startRecording = () => {
     if (!streamRef.current) {
-      toast({
-        title: "No Camera/Microphone",
-        description: "Please enable camera first to start recording.",
-        variant: "destructive",
-      });
+      toast({ title: "No Camera/Microphone", description: "Please enable camera and microphone first to start recording.", variant: "destructive" });
       return;
     }
 
     setIsRecording(true);
-    setTranscript('');
     setCurrentAnswer('');
-    
-    // Start speech recognition
-    if (recognitionRef.current) {
-      recognitionRef.current.start();
-    }
+    setRecordedBlob(null);
+    setIsTranscribing(false);
 
-    // Start media recording
-    mediaRecorderRef.current = new MediaRecorder(streamRef.current);
+    mediaRecorderRef.current = new MediaRecorder(streamRef.current, { mimeType: 'video/webm' });
     const recordedChunks: Blob[] = [];
-    
+
     mediaRecorderRef.current.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        recordedChunks.push(event.data);
+      if (event.data.size > 0) recordedChunks.push(event.data);
+    };
+
+    mediaRecorderRef.current.onstop = async () => {
+      const blob = new Blob(recordedChunks, { type: 'video/webm' });
+
+      setIsTranscribing(true);
+      if (!currentSession.threadId) {
+        toast({ title: "Error", description: "Session ID is missing for transcription.", variant: "destructive" });
+        setIsTranscribing(false);
+        return;
+      }
+
+      try {
+        const response = await apiService.transcribeGroq(
+          currentSession.threadId,
+          currentQuestionIndex,
+          blob
+        );
+        setCurrentAnswer(response.text);
+        setRecordedBlob(blob);
+        toast({ title: "Transcription Complete", description: "Answer successfully transcribed" });
+      } catch (e) {
+        const errorMessage = e instanceof Error ? e.message : "An unknown error occurred.";
+        setCurrentAnswer(`[Transcription Failed: ${errorMessage}]`);
+        toast({ title: "Transcription Failed", description: errorMessage, variant: "destructive" });
+      } finally {
+        setIsTranscribing(false);
       }
     };
-    
-    mediaRecorderRef.current.onstop = () => {
-      const blob = new Blob(recordedChunks, { type: 'video/webm' });
-      console.log('Recording stopped, blob size:', blob.size);
-    };
-    
+
     mediaRecorderRef.current.start();
   };
 
   const stopRecording = () => {
     setIsRecording(false);
-    
-    // Stop speech recognition
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
-    
-    // Stop media recording
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
     }
-    
-    // Finalize the transcribed answer
-    if (transcript) {
-      setCurrentAnswer(transcript);
-    }
-    setTranscript('');
   };
 
   const submitInterview = async () => {
     if (!currentSession.threadId || !currentSession.state) return;
-    
+
+    saveAnswer();
     try {
-      // Filter out empty answers
-      const validAnswers = answers.filter(answer => answer.trim().length > 0);
-      
+      const answersToSend = answers;
       const response = await apiService.evaluateInterview({
-        state: { ...currentSession.state, candidate_answers: validAnswers },
+        state: { 
+          ...currentSession.state, 
+          candidate_answers: answersToSend,
+          interview_questions: interviewData?.interview_questions || []
+        },
         thread_id: currentSession.threadId
       });
-      
-      // Store results in localStorage for the results page
+
       const results = {
         interview_score: response.interview_score,
         feedback: response.feedback,
         state: {
-          candidate_answers: validAnswers,
+          candidate_answers: answersToSend, 
           interview_questions: interviewData?.interview_questions || []
         }
       };
       localStorage.setItem('interview-results', JSON.stringify(results));
-      
-      toast({
-        title: "Interview Submitted",
-        description: `Interview evaluated with score: ${Math.round((response.interview_score || 0) * 100)}%`,
-      });
-      
-      // Navigate to results page
+      toast({ title: "Interview Submitted", description: `Interview evaluated with score: ${Math.round((response.interview_score || 0) * 100)}%` });
       navigate('/interviews/results');
-      
     } catch (error) {
-      toast({
-        title: "Submission Failed",
-        description: "Failed to submit interview answers.",
-        variant: "destructive",
-      });
+      toast({ title: "Submission Failed", description: "Failed to submit interview answers.", variant: "destructive" });
     }
   };
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">Interview Questions</h1>
-        <p className="text-muted-foreground">
-          Generate interview questions and provide recorded answers for candidate evaluation
-        </p>
+      <div className="flex justify-between items-center">
+        <div>
+          <h1 className="text-2xl font-bold text-foreground">Interview Questions</h1>
+          <p className="text-muted-foreground">
+            Generate interview questions and provide recorded answers for candidate evaluation
+          </p>
+        </div>
+
+        {/* Timer Display */}
+        {interviewData && interviewData.interview_questions?.length > 0 && (
+          <div className="bg-blue-50 text-blue-800 px-4 py-2 rounded-md font-semibold">
+            ⏱ Time Left: {formatTime(timeLeft)}
+          </div>
+        )}
       </div>
 
       {/* Interview Generation/Display */}
@@ -408,29 +368,28 @@ export default function InterviewQuestions() {
                     <CardHeader>
                       <CardTitle className="text-base">Record Your Answer</CardTitle>
                     </CardHeader>
-                    <CardContent className="space-y-4">
-                      <div className="text-center">
-                        <Button
-                          variant={isRecording ? "destructive" : "default"}
-                          onClick={isRecording ? stopRecording : startRecording}
-                          disabled={!isVideoEnabled}
-                          className="gap-2"
-                          size="lg"
-                        >
-                          {isRecording ? <Square className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
-                          {isRecording ? 'Stop Recording' : 'Record Answer'}
-                        </Button>
-                        <p className="text-sm text-muted-foreground mt-2">
-                          {isRecording ? 'Recording your response...' : 'Click to record your answer'}
-                        </p>
-                      </div>
+                    <CardContent className="text-center space-y-4">
+                      <Button
+                        variant={isRecording ? "destructive" : "default"}
+                        onClick={isRecording ? stopRecording : startRecording}
+                        disabled={!isVideoEnabled || isTranscribing}
+                        className="gap-2"
+                        size="lg"
+                      >
+                        {isRecording ? <Square className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+                        {isRecording ? 'Stop Recording' : 'Record Answer'}
+                      </Button>
+                      <p className="text-sm text-muted-foreground mt-2">
+                        {isRecording ? 'Recording your response...' : (isTranscribing ? 'Awaiting Transcription...' : 'Click to record your answer')}
+                      </p>
                       
-                      {transcript && (
-                        <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                          <div className="text-sm font-medium text-blue-800 mb-1">Live Transcript:</div>
-                          <div className="text-sm text-blue-700">{transcript}</div>
+                      {isTranscribing && (
+                        <div className="flex items-center justify-center p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                          <Loader2 className="h-4 w-4 animate-spin mr-2 text-blue-700" />
+                          <span className="text-sm font-medium text-blue-800">Transcribing...</span>
                         </div>
                       )}
+                      
                     </CardContent>
                   </Card>
                 </div>
@@ -457,27 +416,21 @@ export default function InterviewQuestions() {
                     </CardContent>
                   </Card>
 
-                  {/* Answer Input */}
+                  {/* Answer Display and Save Button - TEXTAREA REMOVED */}
                   <Card>
                     <CardHeader>
-                      <CardTitle className="text-base">Your Answer</CardTitle>
+                      <CardTitle className="text-base">Transcribed Answer</CardTitle>
                     </CardHeader>
                     <CardContent className="space-y-4">
-                      <div>
-                        <label className="text-sm font-medium mb-2 block">
-                          Transcribed answer (you can edit if needed)
-                        </label>
-                        <Textarea
-                          value={currentAnswer}
-                          onChange={(e) => setCurrentAnswer(e.target.value)}
-                          placeholder="Your recorded answer will appear here..."
-                          className="min-h-[200px] resize-none"
-                        />
+                      <div className="p-4 bg-muted border rounded-lg min-h-[150px]">
+                        <p className="text-sm text-foreground whitespace-pre-wrap">
+                          {currentAnswer || (isTranscribing ? "Transcription in progress..." : "No recorded answer for this question.")}
+                        </p>
                       </div>
 
                       <Button 
                         onClick={saveAnswer}
-                        disabled={!currentAnswer.trim()}
+                        disabled={!currentAnswer.trim() || isTranscribing}
                         className="gap-2"
                       >
                         <CheckCircle className="h-4 w-4" />
@@ -490,20 +443,20 @@ export default function InterviewQuestions() {
                   <div className="flex justify-between">
                     <Button
                       onClick={prevQuestion}
-                      disabled={currentQuestionIndex === 0}
+                      disabled={currentQuestionIndex === 0 || isTranscribing}
                       variant="outline"
                     >
                       Previous Question
                     </Button>
                     
                     {currentQuestionIndex < interviewData.interview_questions.length - 1 ? (
-                      <Button onClick={nextQuestion}>
+                      <Button onClick={nextQuestion} disabled={isTranscribing}>
                         Next Question
                       </Button>
                     ) : (
                       <Button 
                         onClick={submitInterview}
-                        disabled={answers.filter(a => a.trim()).length === 0}
+                        disabled={answers.filter(a => a.trim()).length === 0 || isTranscribing}
                         className="gap-2"
                       >
                         <Send className="h-4 w-4" />
