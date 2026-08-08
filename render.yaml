@@ -3,18 +3,22 @@ services:
     name: talentfitai-api
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter          # free tier has no persistent disks and sleeps on idle
+    # Free plan: 512MB RAM, no persistent disk, spins down after ~15 min idle.
+    # Embeddings run on the HF Inference API instead of a local torch model,
+    # which is what keeps the footprint inside 512MB.
+    plan: free
     healthCheckPath: /
-    disk:
-      name: talentfitai-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
+      # No persistent disk on the free plan, so the DB lives in the container
+      # and reseeds from the committed jds.db on every boot. JDs added through
+      # the admin panel at runtime do NOT survive a restart.
       - key: DB_PATH
-        value: /var/data/jds.db
+        value: /app/jds.db
       - key: GROQ_API_KEY
         sync: false        # set in the Render dashboard
       - key: TAVILY_API_KEY
         sync: false
+      - key: HF_TOKEN
+        sync: false        # required for embeddings
       - key: CORS_ORIGINS
-        sync: false        # e.g. https://talentfitai.vercel.app
+        sync: false        # e.g. https://frontend-jade-six-87.vercel.app

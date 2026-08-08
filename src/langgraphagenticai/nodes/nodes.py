@@ -1,12 +1,15 @@
+import os
 import re
 import string
 import json
+import time
+import hashlib
+import logging
 import numpy as np
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.exceptions import OutputParserException
@@ -21,7 +24,24 @@ from src.langgraphagenticai.tools.web_search_tool import WebSearchTool
 from src.langgraphagenticai.tools.interview_search_tool import InterviewWebSearchTool
 
 
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+logger = logging.getLogger(__name__)
+
+# Embeddings are served by the HuggingFace Inference API rather than a local
+# SentenceTransformer. It is the same all-MiniLM-L6-v2 checkpoint, so the vectors
+# (and therefore match scores) are unchanged -- but it keeps torch out of the
+# image, which drops the runtime footprint from ~516MB to ~200MB and lets the
+# service fit a 512MB free tier.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+HF_EMBEDDING_URL = (
+    f"https://router.huggingface.co/hf-inference/models/{EMBEDDING_MODEL}"
+    "/pipeline/feature-extraction"
+)
+_HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip().strip("\"'")
+
+# match_all_jds re-embeds the same resume once per JD, so a small cache turns
+# 2N API calls into N+1.
+_EMBEDDING_CACHE: dict[str, np.ndarray] = {}
+_EMBEDDING_CACHE_MAX = 128
 
 # ------------------ Utility functions ------------------ #
 
@@ -50,7 +70,45 @@ def tokenize_text(text: str):
     return sent_tokenize(text), word_tokenize(text)
 
 def get_embedding(text: str) -> np.ndarray:
-    return np.array(embedding_model.encode([text]))
+    """Mean-pooled all-MiniLM-L6-v2 embedding, shape (1, 384).
+
+    Raises RuntimeError if the Inference API cannot be reached; callers decide
+    how to degrade.
+    """
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if key in _EMBEDDING_CACHE:
+        return _EMBEDDING_CACHE[key]
+
+    if not _HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not set; cannot compute embeddings.")
+
+    headers = {"Authorization": f"Bearer {_HF_TOKEN}"}
+    last_error = None
+    for attempt in range(3):
+        try:
+            resp = httpx.post(
+                HF_EMBEDDING_URL,
+                headers=headers,
+                json={"inputs": text, "options": {"wait_for_model": True}},
+                timeout=30.0,
+            )
+            # 503 means the model is spinning up on HF's side.
+            if resp.status_code == 503:
+                time.sleep(2 * (attempt + 1))
+                last_error = f"model loading (503)"
+                continue
+            resp.raise_for_status()
+            vector = np.array(resp.json(), dtype=float).reshape(1, -1)
+
+            if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAX:
+                _EMBEDDING_CACHE.clear()
+            _EMBEDDING_CACHE[key] = vector
+            return vector
+        except Exception as e:  # noqa: BLE001 - retried below, surfaced after
+            last_error = e
+            time.sleep(1.5 * (attempt + 1))
+
+    raise RuntimeError(f"HF embedding request failed after 3 attempts: {last_error}")
 
 def vectorize_texts(resume_text: str, jd_text: str):
     tfidf = TfidfVectorizer()
@@ -61,7 +119,17 @@ def vectorize_texts(resume_text: str, jd_text: str):
     bow_matrix = bow.fit_transform([resume_text, jd_text])
     bow_score = float(cosine_similarity(bow_matrix[0:1], bow_matrix[1:2])[0][0])
 
-    emb_score = float(cosine_similarity(get_embedding(resume_text), get_embedding(jd_text))[0][0])
+    try:
+        emb_score = float(
+            cosine_similarity(get_embedding(resume_text), get_embedding(jd_text))[0][0]
+        )
+    except Exception as e:  # noqa: BLE001
+        # The embedding term is 50% of match_score. Falling back to the TF-IDF
+        # score keeps ranking usable when the free Inference API is rate-limited,
+        # instead of collapsing the whole match to zero.
+        logger.warning("Embedding unavailable (%s); falling back to TF-IDF score.", e)
+        emb_score = tfidf_score
+
     return tfidf_score, bow_score, emb_score
 
 # ------------------ Skill List ------------------ #

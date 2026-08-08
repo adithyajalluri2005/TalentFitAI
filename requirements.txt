@@ -16,7 +16,8 @@ groq                      # used directly for Whisper transcription
 tavily-python
 
 # --- NLP / matching ---
-sentence-transformers
+# No sentence-transformers/torch on purpose: embeddings come from the HF
+# Inference API (see nodes.py get_embedding), which keeps this under a 512MB tier.
 scikit-learn
 nltk
 numpy
