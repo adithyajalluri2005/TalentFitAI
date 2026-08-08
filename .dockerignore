@@ -1,0 +1,14 @@
+.git
+.gitignore
+.conda
+__pycache__
+**/__pycache__
+*.pyc
+.env
+frontend
+node_modules
+*.md
+1.py
+jd.txt
+jd1.txt
+src/test.py

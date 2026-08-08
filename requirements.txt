@@ -1,12 +1,24 @@
+# --- Web layer ---
+fastapi
+uvicorn[standard]
+python-multipart          # required by FastAPI for UploadFile / Form
+pydantic
+sqlalchemy
+python-dotenv
+
+# --- LLM / agent stack ---
 langchain
 langgraph
 langchain_community
 langchain_core
 langchain_groq
-langchain_openai
-faiss-cpu
-streamlit
+groq                      # used directly for Whisper transcription
 tavily-python
-fastapi 
-uvicorn
-pydantic
+
+# --- NLP / matching ---
+sentence-transformers
+scikit-learn
+nltk
+numpy
+pypdf
+httpx

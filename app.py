@@ -6,10 +6,6 @@ from groq import Groq
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from ultralytics import YOLO                         # YOLOv8 model
-from PIL import Image                  
-import cv2
-import io  
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 # Database imports
@@ -26,10 +22,18 @@ from datetime import datetime
 # ---------------------------
 # Database Configuration (SQLite) - CORRECTED
 # ---------------------------
-# Use a standard relative path for sqlite3 functions
-DB_FILE_PATH = "./jds.db"
+# DB_PATH lets the host point this at a persistent disk (e.g. /var/data/jds.db on
+# Render); falls back to the repo-local file for local development.
+DB_FILE_PATH = os.getenv("DB_PATH", "./jds.db")
+os.makedirs(os.path.dirname(os.path.abspath(DB_FILE_PATH)), exist_ok=True)
+
+# On a fresh persistent disk, seed from the copy committed to the repo so an
+# existing set of JDs survives the move to a hosted environment.
+if not os.path.exists(DB_FILE_PATH) and os.path.exists("./jds.db"):
+    shutil.copyfile("./jds.db", DB_FILE_PATH)
+
 # Use the full URI for SQLAlchemy
-SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_FILE_PATH}" 
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_FILE_PATH}"
 
 # SQLAlchemy Setup
 engine = create_engine(
@@ -88,9 +92,15 @@ app = FastAPI(
     description="Backend for LangGraph-powered Talent Acquisition Assistant with JD Admin."
 )
 
+# Comma-separated list of allowed origins, e.g.
+# "https://talentfitai.vercel.app,http://localhost:8080". Defaults to open.
+CORS_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -140,7 +150,11 @@ class JDSummary(BaseModel):
 # Utility (Unchanged)
 # ---------------------------
 def save_resume(resume: UploadFile, thread_id: str) -> str:
-    temp_path = f"temp_{thread_id}_{resume.filename}"
+    # Written to the system temp dir so the app works on hosts with a read-only
+    # application directory.
+    temp_path = os.path.join(
+        tempfile.gettempdir(), f"temp_{thread_id}_{resume.filename}"
+    )
     resume.file.seek(0)
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(resume.file, buffer)

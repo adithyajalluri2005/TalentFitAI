@@ -15,7 +15,7 @@ import asyncio
 
 
 from src.langgraphagenticai.state import state
-from src.langgraphagenticai.state.state import CandidateState, MCQAssessment, InterviewAssessment
+from src.langgraphagenticai.state.state import CandidateState, MCQAssessment, InterviewAssessment, MCQQuestion
 from src.langgraphagenticai.LLMS.groqllm import GroqLLM
 from src.langgraphagenticai.tools.web_search_tool import WebSearchTool
 from src.langgraphagenticai.tools.interview_search_tool import InterviewWebSearchTool
@@ -146,7 +146,166 @@ def clean_json_string(s: str) -> str:
     s = re.sub(r",\s*([\]}])", r"\1", s)
     # 2. Remove control characters
     s = re.sub(r"[\x00-\x1f]+", "", s)
+    # 3. Normalize smart quotes that break JSON
+    s = (
+        s.replace("\u201c", "\"")
+        .replace("\u201d", "\"")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
     return s
+
+def extract_balanced_json_blocks(text: str) -> list[str]:
+    """Extract balanced top-level JSON object/array blocks from text."""
+    blocks = []
+    stack = []
+    in_string = False
+    escape = False
+    start = None
+
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch in "{[":
+            if not stack:
+                start = i
+            stack.append(ch)
+            continue
+
+        if ch in "}]":
+            if not stack:
+                continue
+            opener = stack[-1]
+            if (opener == "{" and ch == "}") or (opener == "[" and ch == "]"):
+                stack.pop()
+                if not stack and start is not None:
+                    blocks.append(text[start:i + 1])
+                    start = None
+            else:
+                stack = []
+                start = None
+    return blocks
+
+def normalize_mcq_payload(obj):
+    """Normalize known MCQ key variants from LLM output."""
+    if isinstance(obj, list):
+        return {"questions": obj}
+    if not isinstance(obj, dict):
+        return obj
+    questions = obj.get("questions")
+    if isinstance(questions, list):
+        for q in questions:
+            if isinstance(q, dict) and "answer" not in q and "correct_answer" in q:
+                q["answer"] = q["correct_answer"]
+    return obj
+
+def extract_llm_text(response) -> str:
+    """Extract plain text from LangChain AIMessage-like responses."""
+    if response is None:
+        return ""
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+def build_fallback_mcqs(skills, total=25):
+    """Guaranteed-valid fallback MCQs when LLM JSON is malformed."""
+    if not skills:
+        skills = ["programming"]
+    skills = [s for s in skills if s] or ["programming"]
+
+    templates = [
+        (
+            "Which option best describes the primary use of {skill}?",
+            [
+                "A. Building and maintaining software solutions",
+                "B. Only designing hardware circuits",
+                "C. Only managing office spreadsheets",
+                "D. Only editing image files"
+            ],
+            "A",
+            "{skill} is primarily used for software development tasks and problem-solving."
+        ),
+        (
+            "In {skill}, what is the best first step when debugging an issue?",
+            [
+                "A. Remove random lines of code",
+                "B. Reproduce the issue consistently and inspect inputs",
+                "C. Rename all variables",
+                "D. Ignore warnings and retry later"
+            ],
+            "B",
+            "Reliable debugging starts by reproducing the issue and checking inputs/outputs."
+        ),
+        (
+            "Which practice improves code quality in {skill} projects?",
+            [
+                "A. Writing tests for key logic",
+                "B. Avoiding code reviews",
+                "C. Keeping undocumented side effects",
+                "D. Skipping error handling"
+            ],
+            "A",
+            "Tests help catch regressions and validate behavior over time."
+        ),
+        (
+            "What is a common optimization approach in {skill} code?",
+            [
+                "A. Increase nested loops without reason",
+                "B. Use clearer algorithms and reduce unnecessary work",
+                "C. Duplicate logic across files",
+                "D. Convert all numbers to strings"
+            ],
+            "B",
+            "Choosing better algorithms and reducing redundant operations usually improves performance."
+        ),
+        (
+            "When handling user input in {skill}, what is recommended?",
+            [
+                "A. Trust all input without checks",
+                "B. Validate and sanitize input before processing",
+                "C. Disable error messages entirely",
+                "D. Store raw input in executable code"
+            ],
+            "B",
+            "Validation and sanitization reduce bugs and security risks."
+        ),
+    ]
+
+    out = []
+    for i in range(total):
+        skill = skills[i % len(skills)]
+        t = templates[i % len(templates)]
+        out.append(
+            MCQQuestion(
+                question=t[0].format(skill=skill),
+                options=t[1],
+                answer=t[2],
+                explanation=t[3].format(skill=skill),
+            )
+        )
+    return out
 
 # --- The core safe parsing function ---
 def safe_parse_json(response_text, parser=None):
@@ -171,36 +330,22 @@ def safe_parse_json(response_text, parser=None):
     try:
         obj = json.loads(response_text)
     except json.JSONDecodeError:
-        # 2. Fallback: Find the first valid {...} or [...] block
-        
-        # Array extraction is often prioritized for list responses like feedback
-        start_arr = response_text.find('[')
-        end_arr = response_text.rfind(']')
-        
-        # Object extraction
-        start_obj = response_text.find('{')
-        end_obj = response_text.rfind('}')
-
-        json_str = None
-
-        # Prioritize the array if it appears before the object, or if there's no object
-        if start_arr != -1 and end_arr != -1 and (start_arr < start_obj or start_obj == -1):
-             json_str = response_text[start_arr:end_arr + 1]
-        # Otherwise, use the object block
-        elif start_obj != -1 and end_obj != -1:
-             json_str = response_text[start_obj:end_obj + 1]
-        
-        if json_str:
+        # 2. Fallback: parse any balanced JSON block found in mixed text
+        blocks = extract_balanced_json_blocks(response_text)
+        last_error = None
+        for json_str in blocks:
             try:
                 obj = json.loads(json_str)
+                break
             except json.JSONDecodeError as e:
-                # This is the point where 'Extra data' errors often surface if the regex extraction was too broad.
-                # However, by using rfind() for the end, we aim to capture the outermost structure.
-                raise OutputParserException(f"Could not decode JSON: {e}")
+                last_error = e
+        if obj is None and last_error:
+            raise OutputParserException(f"Could not decode JSON: {last_error}")
 
     if obj is None:
         raise OutputParserException("No JSON object or array found in response.")
 
+    obj = normalize_mcq_payload(obj)
     return parser.parse(json.dumps(obj)) if parser else obj
 
 def extract_experience(text: str) -> str:
@@ -362,7 +507,12 @@ class WebSearchChatbotNode:
 
             for skill in state.missing_skills:
                 print(f"\n🔍 Processing skill: {skill}")
-                query = f"Best free resources to learn {skill} programming (docs, tutorials, YouTube, courses)"
+                query = (
+                        f"Top high-quality free learning resources for {skill} programming: "
+                        f"official documentation, interactive tutorials, YouTube playlists, blogs, GitHub repositories, "
+                        f"beginner-friendly courses, and learning roadmaps."
+                    ) 
+
                 search_results = self.web_search_tool.run(query)
                 print(f"🌐 Raw search output for {skill} (first 300 chars):\n{str(search_results)[:300]}")
 
@@ -472,11 +622,57 @@ class WebSearchChatbotNode:
             """
 
             response = self.llm.llm.invoke(prompt)
-            parsed_data = safe_parse_json(response.content)
-            parsed_object = self.mcq_parser.parse(json.dumps(parsed_data))
+            raw = str(getattr(response, "content", response) or "").strip()
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+            print(f"🔎 MCQ raw response length: {len(raw)}")
+            try:
+                parsed_data = safe_parse_json(raw)
+            except Exception as parse_err:
+                print(f"⚠️ JSON parse failed for MCQs: {parse_err}. Using fallback MCQs.")
+                state.mcqs = build_fallback_mcqs(state.jd_skills, 25)
+                print(f"✅ Generated {len(state.mcqs)} fallback MCQs.")
+                return state
+            if isinstance(parsed_data, list):
+                parsed_data = {"questions": parsed_data}
+
+            questions_raw = parsed_data.get("questions", []) if isinstance(parsed_data, dict) else []
+            valid_mcqs = []
+            for i, q in enumerate(questions_raw):
+                if not isinstance(q, dict):
+                    continue
+                if "answer" not in q and "correct_answer" in q:
+                    q["answer"] = q["correct_answer"]
+
+                options = q.get("options", [])
+                if not isinstance(options, list) or len(options) < 4:
+                    print(f"⚠️ Skipping malformed MCQ at index {i}: invalid options")
+                    continue
+
+                q["options"] = [str(opt).strip() for opt in options[:4]]
+
+                try:
+                    mcq = MCQQuestion(
+                        question=str(q.get("question", "")).strip(),
+                        options=q["options"],
+                        answer=str(q.get("answer", "")).strip(),
+                        explanation=str(q.get("explanation", "")).strip(),
+                    )
+                except Exception as ve:
+                    print(f"⚠️ Skipping malformed MCQ at index {i}: {ve}")
+                    continue
+
+                if not mcq.question or not mcq.answer or not mcq.explanation:
+                    print(f"⚠️ Skipping malformed MCQ at index {i}: missing text fields")
+                    continue
+
+                valid_mcqs.append(mcq)
+
+            if not valid_mcqs:
+                raise OutputParserException("No valid MCQs found in model response.")
             
             # ---- Convert correct answer text to single letter A-D ----
-            for mcq in parsed_object.questions:
+            for mcq in valid_mcqs:
                 found = False
                 
                 # Normalize the expected answer text from the LLM
@@ -502,7 +698,7 @@ class WebSearchChatbotNode:
                          mcq.answer = "A"
                          print(f"⚠️ Correct answer text/letter '{mcq.answer}' not found in options, defaulted to 'A'")
 
-            state.mcqs = parsed_object.questions
+            state.mcqs = valid_mcqs[:25]
             print(f"✅ Generated {len(state.mcqs)} MCQs successfully.")
 
         except Exception as e:
@@ -616,13 +812,42 @@ class WebSearchChatbotNode:
             """
 
             response = self.llm.llm.invoke(prompt)
-            parsed_feedback = safe_parse_json(response.content)
+            raw = str(getattr(response, "content", response) or "").strip()
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+            parsed_feedback = safe_parse_json(raw)
 
-            if not isinstance(parsed_feedback, list):
+            # Normalize shapes:
+            # 1) expected: [ {...}, {...} ]
+            # 2) common variant: { "questions": [ {...}, {...} ] }
+            if isinstance(parsed_feedback, dict) and isinstance(parsed_feedback.get("questions"), list):
+                parsed_feedback = parsed_feedback["questions"]
+            elif isinstance(parsed_feedback, dict) and isinstance(parsed_feedback.get("feedback"), list):
+                parsed_feedback = parsed_feedback["feedback"]
+            elif not isinstance(parsed_feedback, list):
                 parsed_feedback = [{"question_index": 1, "review_feedback": str(parsed_feedback)}]
 
-            # --- FIX: Convert the list of dicts to a JSON string before saving to state ---
-            state.feedback = json.dumps(parsed_feedback) # <--- THIS IS THE FIX
+            # Ensure one feedback item per interview question index
+            normalized_feedback = []
+            by_index = {}
+            for item in parsed_feedback:
+                if not isinstance(item, dict):
+                    continue
+                idx = item.get("question_index")
+                text = item.get("review_feedback")
+                if isinstance(idx, int) and idx >= 1 and isinstance(text, str) and text.strip():
+                    by_index[idx] = text.strip()
+
+            total_questions = len(state.interview_questions or [])
+            for idx in range(1, total_questions + 1):
+                answer_text = state.candidate_answers[idx - 1] if idx - 1 < len(state.candidate_answers) else "NO_ANSWER_PROVIDED"
+                default_text = "No answer provided." if answer_text in ["NO_ANSWER_PROVIDED", "", None] else "No specific AI feedback generated for this question."
+                normalized_feedback.append({
+                    "question_index": idx,
+                    "review_feedback": by_index.get(idx, default_text)
+                })
+
+            state.feedback = json.dumps(normalized_feedback)
 
             return state
 
