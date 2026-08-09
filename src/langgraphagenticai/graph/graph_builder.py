@@ -1,4 +1,5 @@
 from typing import Optional, Any
+import os
 import uuid
 
 from langgraph.graph import StateGraph, START, END
@@ -27,7 +28,8 @@ class GraphBuilder:
     Helper run_* methods accept CandidateState or plain dict and return CandidateState.
     """
 
-    def __init__(self, model_name: str = "deepseek-r1-distill-llama-70b"):
+    def __init__(self, model_name: str = None):
+        model_name = model_name or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         self.llm = GroqLLM(model_name=model_name)
         self.recruitment_node = WebSearchChatbotNode(self.llm)
 

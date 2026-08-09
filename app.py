@@ -94,8 +94,12 @@ app = FastAPI(
 
 # Comma-separated list of allowed origins, e.g.
 # "https://talentfitai.vercel.app,http://localhost:8080". Defaults to open.
+# An empty/whitespace value falls back to "*" rather than an empty list, which
+# would reject every origin and surface as an opaque CORS failure in the browser.
 CORS_ORIGINS = [
-    o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()
+    o.strip()
+    for o in ((os.getenv("CORS_ORIGINS") or "").strip() or "*").split(",")
+    if o.strip()
 ]
 
 app.add_middleware(
@@ -106,11 +110,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-graph_builder = GraphBuilder(model_name="qwen/qwen3-32b") 
+# Groq retires models periodically (qwen/qwen3-32b was decommissioned), so the
+# model id is configurable without a code change. Keep to models whose reasoning
+# is either absent or wrapped in <think> tags -- nodes.py strips those before
+# parsing JSON, and a model that emits bare reasoning prose breaks the parser.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+graph_builder = GraphBuilder(model_name=GROQ_MODEL)
 ACTIVE_SESSIONS: Dict[str, CandidateState] = {}
 
 try:
-    temp_llm_instance = GroqLLM(model_name="qwen/qwen3-32b")
+    temp_llm_instance = GroqLLM(model_name=GROQ_MODEL)
     temp_node = WebSearchChatbotNode(llm=temp_llm_instance)
 except Exception as e:
     print(f"Warning: Could not initialize temp_node for utility matching: {e}")
