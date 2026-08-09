@@ -17,9 +17,35 @@ export default function AdminJDPanel() {
 
   const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+  // These calls use fetch rather than the axios instance, so the bearer token
+  // has to be attached by hand; the axios interceptors do not apply here.
+  const authHeaders = (extra: Record<string, string> = {}) => {
+    const token = localStorage.getItem("authToken");
+    return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
+  };
+
+  const handleAuthFailure = (res: Response) => {
+    if (res.status === 401) {
+      window.dispatchEvent(new CustomEvent("auth:unauthorized"));
+      return true;
+    }
+    if (res.status === 403) {
+      toast.error("Admin privileges required");
+      return true;
+    }
+    return false;
+  };
+
   const loadJDs = async () => {
     try {
-      const res = await fetch(`${API_BASE}/admin/jds`);
+      const res = await fetch(`${API_BASE}/admin/jds`, {
+        headers: authHeaders(),
+      });
+      if (handleAuthFailure(res)) return;
+      if (!res.ok) {
+        toast.error("Failed to load JDs");
+        return;
+      }
       const data = await res.json();
       setJds(data);
     } catch {
@@ -37,7 +63,7 @@ export default function AdminJDPanel() {
     try {
       const res = await fetch(`${API_BASE}/admin/jds`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           title,
           company,
@@ -45,6 +71,8 @@ export default function AdminJDPanel() {
           date: new Date().toISOString(),
         }),
       });
+
+      if (handleAuthFailure(res)) return;
 
       if (res.ok) {
         toast.success("JD added successfully");
@@ -64,7 +92,15 @@ export default function AdminJDPanel() {
 
   const handleDeleteJD = async (id: number) => {
     try {
-      await fetch(`${API_BASE}/admin/jds/${id}`, { method: "DELETE" });
+      const res = await fetch(`${API_BASE}/admin/jds/${id}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      if (handleAuthFailure(res)) return;
+      if (!res.ok) {
+        toast.error("Failed to delete JD");
+        return;
+      }
       toast.success("JD deleted");
       loadJDs();
     } catch {

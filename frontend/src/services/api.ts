@@ -11,6 +11,42 @@ const api = axios.create({
 });
 
 // ============================================================
+// 🔐 Auth wiring
+// ============================================================
+/**
+ * Attach the stored bearer token to every request, and surface a rejected token
+ * as a single app-wide event so AuthContext can clear the session once.
+ * Applied to the bare `axios` default too, since a few calls below use it
+ * directly rather than the `api` instance.
+ */
+const attachAuthInterceptors = (client: typeof axios | typeof api) => {
+  client.interceptors.request.use((config) => {
+    const token = localStorage.getItem('authToken');
+    if (token) {
+      config.headers = config.headers ?? {};
+      (config.headers as Record<string, string>).Authorization = `Bearer ${token}`;
+    }
+    return config;
+  });
+
+  client.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      // A 401 from the login endpoint means "wrong password", not "session
+      // expired" -- let LoginPage report it instead of forcing a logout.
+      const url: string = error?.config?.url ?? '';
+      if (error?.response?.status === 401 && !url.includes('/auth/login')) {
+        window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+      }
+      return Promise.reject(error);
+    },
+  );
+};
+
+attachAuthInterceptors(api);
+attachAuthInterceptors(axios);
+
+// ============================================================
 // 🧩 Types
 // ============================================================
 export interface CandidateState {
