@@ -376,10 +376,15 @@ def build_fallback_mcqs(skills, total=25):
     return out
 
 # --- The core safe parsing function ---
-def safe_parse_json(response_text, parser=None):
+def safe_parse_json(response_text, parser=None, normalize_mcq=True):
     """
     Safely parse JSON from LLM output (string or dict).
     Handles extra text, thought tags, code fences, and control chars.
+
+    normalize_mcq wraps a bare top-level array into {"questions": [...]}, which is
+    what the MCQ and interview parsers expect. Pass False when the caller wants a
+    JSON array to stay an array -- otherwise the list is hidden behind a
+    "questions" key and looks like a single unrecognised object.
     """
     if isinstance(response_text, dict):
         return parser.parse(json.dumps(response_text)) if parser else response_text
@@ -413,7 +418,8 @@ def safe_parse_json(response_text, parser=None):
     if obj is None:
         raise OutputParserException("No JSON object or array found in response.")
 
-    obj = normalize_mcq_payload(obj)
+    if normalize_mcq:
+        obj = normalize_mcq_payload(obj)
     return parser.parse(json.dumps(obj)) if parser else obj
 
 def extract_experience(text: str) -> str:
@@ -611,8 +617,10 @@ class WebSearchChatbotNode:
                     response = self.llm.llm.invoke(prompt)
                     raw = (response.content or "").strip()
                     
-                    # Use the robust safe_parse_json utility
-                    parsed_data = safe_parse_json(raw)
+                    # normalize_mcq=False: the prompt asks for a JSON array of
+                    # resources, and the MCQ normalisation would bury it under a
+                    # "questions" key.
+                    parsed_data = safe_parse_json(raw, normalize_mcq=False)
                     
                     # Ensure the parsed data is a list of dictionaries
                     if isinstance(parsed_data, dict):
@@ -626,17 +634,38 @@ class WebSearchChatbotNode:
                     print(f"⚠️ LLM ranking/naming error for {skill}: {e}. Keeping default top 5.")
                     ranked = extracted[:5]
 
-                # Filter the LLM output to match the expected structure and limit to top 5
+                # Coerce the LLM output into the expected structure. A missing
+                # title or type is filled in rather than dropping the resource;
+                # only a missing URL makes an entry useless. The LLM is also
+                # prone to padding its "top 5" by repeating URLs when the search
+                # returned fewer than five, so dedupe.
                 final_resources = []
+                seen_urls = set()
                 for item in ranked:
-                    if isinstance(item, dict) and all(key in item for key in ["title", "type", "url"]):
-                        final_resources.append({
-                            "title": item["title"],
-                            "type": item["type"],
-                            "url": item["url"]
-                        })
-                
+                    if not isinstance(item, dict):
+                        continue
+                    url = item.get("url") or item.get("link")
+                    if not url:
+                        continue
+                    url = fix_url(str(url))
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    final_resources.append({
+                        "title": item.get("title") or item.get("name") or url,
+                        "type": item.get("type") or classify_url(url),
+                        "url": url,
+                    })
+
+                # Never report zero resources while usable links are in hand --
+                # that reads as "nothing exists" when it really means "the LLM
+                # replied in an unexpected shape".
+                if not final_resources:
+                    print(f"⚠️ Unusable LLM shape for {skill}; falling back to extracted links")
+                    final_resources = extracted[:5]
+
                 resources[skill] = final_resources[:5]
+                print(f"✅ {skill}: {len(resources[skill])} resources")
 
             state.skill_resources = resources
             print(f"\n📚 Skill gap analysis completed for {len(resources)} skills")
