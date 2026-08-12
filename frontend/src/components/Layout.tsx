@@ -1,20 +1,14 @@
-import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
+import { Link, useLocation } from 'react-router-dom';
 import {
   Users,
   FileText,
-  Target,
   TrendingUp,
   ClipboardList,
   MessageCircle,
   Upload,
   Home,
   ChevronRight,
-  LogIn,
-  LogOut,
 } from 'lucide-react';
-import { useAuth } from '../context/AuthContext'; // ✅ Auth context
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -31,8 +25,6 @@ const navigationSequence = [
 
 export default function Layout({ children }: LayoutProps) {
   const location = useLocation();
-  const navigate = useNavigate();
-  const { isAuthenticated, userRole, logout } = useAuth();
 
   const getCurrentStep = () => {
     const current = navigationSequence.find((nav) => nav.href === location.pathname);
@@ -44,16 +36,6 @@ export default function Layout({ children }: LayoutProps) {
     if (step < currentStep) return 'completed';
     if (step === currentStep) return 'active';
     return 'upcoming';
-  };
-
-  // ✅ Handle login/logout logic
-  const handleAuthAction = () => {
-    if (isAuthenticated) {
-      logout();              // clear auth state
-      navigate('/login');    // go to login
-    } else {
-      navigate('/login');    // go to login
-    }
   };
 
   return (
@@ -72,51 +54,17 @@ export default function Layout({ children }: LayoutProps) {
               </span>
             </div>
 
-            {/* Right side (status, role, login/logout) */}
+            {/* Right side (status) */}
             <div className="flex items-center gap-2">
               <div className="w-2 h-2 bg-success rounded-full"></div>
-          
-
-              {/* Role Badge */}
-              {isAuthenticated && (
-                <Badge
-                  variant={userRole === 'admin' ? 'default' : 'secondary'}
-                  className={`text-xs font-semibold ${
-                    userRole === 'admin'
-                      ? 'bg-indigo-600 hover:bg-indigo-700'
-                      : ''
-                  }`}
-                >
-                  {userRole?.toUpperCase()}
-                </Badge>
-              )}
-
-              {/* Login / Logout Button */}
-              <Button
-                onClick={handleAuthAction}
-                variant={isAuthenticated ? 'destructive' : 'default'}
-                size="sm"
-                className="ml-2"
-              >
-                {isAuthenticated ? (
-                  <>
-                    <LogOut className="w-4 h-4 mr-1" />
-                    Logout
-                  </>
-                ) : (
-                  <>
-                    <LogIn className="w-4 h-4 mr-1" />
-                    Login
-                  </>
-                )}
-              </Button>
             </div>
           </div>
         </div>
       </header>
 
-      {/* Progress Navigation — ❌ Hidden for Admin users */}
-      {isAuthenticated && userRole !== 'admin' && (
+      {/* Progress Navigation — ❌ Hidden on the JD admin panel, which is not
+          part of the candidate step sequence */}
+      {!location.pathname.startsWith('/admin') && (
         <nav className="border-b border-border bg-muted/30">
           <div className="container mx-auto px-4 py-3">
             <div className="flex items-center gap-1 overflow-x-auto">

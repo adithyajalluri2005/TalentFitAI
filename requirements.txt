@@ -6,10 +6,6 @@ pydantic
 sqlalchemy
 python-dotenv
 
-# --- Auth ---
-bcrypt
-PyJWT
-
 # --- LLM / agent stack ---
 langchain
 langgraph

@@ -13,16 +13,6 @@ from sqlalchemy import create_engine, Column, String, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-from auth import (
-    LoginRequest,
-    TokenResponse,
-    User,
-    authenticate,
-    create_access_token,
-    get_current_user,
-    require_admin,
-)
-
 from src.langgraphagenticai.graph.graph_builder import GraphBuilder
 from src.langgraphagenticai.state.state import CandidateState # Assumed available
 from src.langgraphagenticai.nodes.nodes import WebSearchChatbotNode
@@ -182,40 +172,15 @@ def save_resume(resume: UploadFile, thread_id: str) -> str:
 
 
 # ---------------------------
-# Auth Endpoints
-# ---------------------------
-@app.post("/auth/login", response_model=TokenResponse)
-def login(payload: LoginRequest):
-    user = authenticate(payload.username, payload.password)
-    if user is None:
-        # Deliberately generic: do not reveal whether the username exists.
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token, expires_in = create_access_token(user)
-    return TokenResponse(
-        access_token=token,
-        role=user.role,
-        username=user.username,
-        expires_in=expires_in,
-    )
-
-
-@app.get("/auth/me", response_model=User)
-def read_current_user(current: User = Depends(get_current_user)):
-    """Lets the frontend validate a stored token on page load."""
-    return current
-
-
-# ---------------------------
 # JD Admin Endpoints (Using sqlite3 for manual CRUD)
+#
+# There is no authentication on this API: the app has no login, so these
+# routes are open to any caller that can reach the service.
 # ---------------------------
 
 # ✅ Add a new JD
 @app.post("/admin/jds", response_model=JDItem)
-def add_jd(jd: JDItem, _: User = Depends(require_admin)):
+def add_jd(jd: JDItem):
     # Use the simple file path
     conn = sqlite3.connect(DB_FILE_PATH)
     cursor = conn.cursor()
@@ -232,7 +197,7 @@ def add_jd(jd: JDItem, _: User = Depends(require_admin)):
 
 # ✅ Get all JDs
 @app.get("/admin/jds", response_model=List[JDResponse])
-def list_jds(_: User = Depends(require_admin)):
+def list_jds():
     # Use the simple file path
     conn = sqlite3.connect(DB_FILE_PATH)
     cursor = conn.cursor()
@@ -253,7 +218,7 @@ def list_jds(_: User = Depends(require_admin)):
 
 # ✅ Delete JD by ID
 @app.delete("/admin/jds/{jd_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_jd(jd_id: int, _: User = Depends(require_admin)):
+def delete_jd(jd_id: int):
     # Use the simple file path
     conn = sqlite3.connect(DB_FILE_PATH)
     cursor = conn.cursor()
@@ -274,7 +239,7 @@ def delete_jd(jd_id: int, _: User = Depends(require_admin)):
 # ---------------------------
 
 @app.get("/jds", response_model=List[JDSummary])
-async def get_jds(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+async def get_jds(db: Session = Depends(get_db)):
     """Returns a list of available job descriptions (ID and Title) from SQLite."""
     # Uses SQLAlchemy Session
     jds = db.query(DBJobDescription).all()
@@ -282,7 +247,7 @@ async def get_jds(db: Session = Depends(get_db), _: User = Depends(get_current_u
 
 
 @app.post("/match-all-jds")
-async def match_all_jds(payload: StatePayload, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+async def match_all_jds(payload: StatePayload, db: Session = Depends(get_db)):
     """Matches the candidate's resume against all JDs in the database and selects the best one."""
     if temp_node is None:
         raise HTTPException(status_code=500, detail="Internal server error: Matching utility not initialized.")
@@ -339,7 +304,7 @@ async def match_all_jds(payload: StatePayload, db: Session = Depends(get_db), _:
 # Unchanged Endpoints
 # ---------------------------
 @app.post("/resume-upload")
-async def resume_upload(resume: UploadFile = File(...), _: User = Depends(get_current_user)):
+async def resume_upload(resume: UploadFile = File(...)):
     thread_id = str(uuid.uuid4())
     temp_path = save_resume(resume, thread_id)
     try:
@@ -360,7 +325,7 @@ async def resume_upload(resume: UploadFile = File(...), _: User = Depends(get_cu
             os.remove(temp_path)
 
 @app.post("/jd-upload")
-async def jd_upload(payload: StatePayload, _: User = Depends(get_current_user)):
+async def jd_upload(payload: StatePayload):
     # Endpoint kept for compatibility, uses graph_builder.run_jd
     try:
         candidate_state = CandidateState(**payload.state)
@@ -378,7 +343,7 @@ async def jd_upload(payload: StatePayload, _: User = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/match")
-async def match_resume_jd(payload: StatePayload, _: User = Depends(get_current_user)):
+async def match_resume_jd(payload: StatePayload):
     # Endpoint kept for compatibility, uses graph_builder.run_match
     try:
         candidate_state = CandidateState(**payload.state)
@@ -397,7 +362,7 @@ async def match_resume_jd(payload: StatePayload, _: User = Depends(get_current_u
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/skill-gap")
-async def skill_gap(payload: StatePayload, _: User = Depends(get_current_user)):
+async def skill_gap(payload: StatePayload):
     try:
         candidate_state = CandidateState(**payload.state)
         final_state = graph_builder.run_skill_gap(candidate_state, thread_id=payload.thread_id)
@@ -416,7 +381,7 @@ async def skill_gap(payload: StatePayload, _: User = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"Skill gap error: {e}")
 
 @app.post("/assessment")
-async def generate_assessment(payload: StatePayload, _: User = Depends(get_current_user)):
+async def generate_assessment(payload: StatePayload):
     try:
         candidate_state = CandidateState(**payload.state)
         final_state = graph_builder.run_assessment(candidate_state, thread_id=payload.thread_id)
@@ -432,7 +397,7 @@ async def generate_assessment(payload: StatePayload, _: User = Depends(get_curre
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.post("/interview")
-async def generate_interview(payload: StatePayload, _: User = Depends(get_current_user)):
+async def generate_interview(payload: StatePayload):
     try:
         candidate_state = CandidateState(**payload.state)
         final_state = graph_builder.run_interview(candidate_state, thread_id=payload.thread_id)
@@ -453,7 +418,6 @@ async def transcribe_groq(
     thread_id: str = Form(...),
     question_index: int = Form(...),
     file: UploadFile = File(...),
-    _: User = Depends(get_current_user),
 ):
     """
     Transcribe uploaded audio using Groq Whisper and store text in session memory.
@@ -513,7 +477,7 @@ async def transcribe_groq(
 
 
 @app.post("/evaluate-interview")
-async def evaluate_interview(payload: StatePayload, _: User = Depends(get_current_user)):
+async def evaluate_interview(payload: StatePayload):
     """
     Evaluate interview answers using the LLM.
     Returns per-question textual feedback only.
