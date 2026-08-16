@@ -1,0 +1,49 @@
+name: keep-alive
+
+# Render's free plan spins a web service down after ~15 minutes with no inbound
+# traffic, and the cold start after that takes ~50s. This pings /health on a
+# schedule so the container stays warm.
+#
+# NOTE: GitHub's scheduled runner is best-effort and is frequently late by
+# several minutes under load. A */15 schedule can therefore land *after* the
+# 15-minute idle window has already closed. If you see cold starts anyway,
+# change the cron below to '*/10 * * * *'.
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:        # lets you trigger a ping by hand from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /health
+        env:
+          # Set this in the repo: Settings > Secrets and variables > Actions >
+          # Variables > New repository variable, name BACKEND_URL, value e.g.
+          # https://talentfitai-api.onrender.com
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          if [ -z "$BACKEND_URL" ]; then
+            echo "::error::BACKEND_URL repository variable is not set."
+            exit 1
+          fi
+
+          url="${BACKEND_URL%/}/health"
+          echo "Pinging $url"
+
+          # A cold instance can take ~60s to boot, so allow a generous timeout
+          # and retry rather than failing the run on the first slow response.
+          code=$(curl -sS -o response.json -w '%{http_code}' \
+                   --max-time 120 --retry 3 --retry-delay 20 --retry-all-errors \
+                   "$url" || echo 000)
+
+          echo "HTTP $code"
+          cat response.json 2>/dev/null || true
+          echo
+
+          if [ "$code" != "200" ]; then
+            echo "::error::Health check failed with HTTP $code"
+            exit 1
+          fi

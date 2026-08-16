@@ -7,7 +7,7 @@ services:
     # Embeddings run on the HF Inference API instead of a local torch model,
     # which is what keeps the footprint inside 512MB.
     plan: free
-    healthCheckPath: /
+    healthCheckPath: /health
     envVars:
       # No persistent disk on the free plan, so the DB lives in the container
       # and reseeds from the committed jds.db on every boot. JDs added through

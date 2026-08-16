@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 import uuid
 import tempfile
 from groq import Groq
@@ -9,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 # Database imports
-from sqlalchemy import create_engine, Column, String, Integer
+from sqlalchemy import create_engine, Column, String, Integer, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -118,6 +119,9 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 graph_builder = GraphBuilder(model_name=GROQ_MODEL)
 ACTIVE_SESSIONS: Dict[str, CandidateState] = {}
+
+# Monotonic so /health uptime is immune to wall-clock jumps.
+PROCESS_START = time.monotonic()
 
 try:
     temp_llm_instance = GroqLLM(model_name=GROQ_MODEL)
@@ -501,3 +505,41 @@ async def evaluate_interview(payload: StatePayload):
 @app.get("/")
 async def root():
     return {"message": "✅ Recruitment Assistant API is running"}
+
+
+# ---------------------------
+# Health Check
+# ---------------------------
+# Kept deliberately cheap: no LLM/network calls, just a DB round-trip, so the
+# external keep-alive ping (.github/workflows/keep-alive.yml) costs nothing but
+# still proves the process can serve real work. Render also uses this as its
+# healthCheckPath.
+@app.get("/health")
+async def health(db: Session = Depends(get_db)):
+    started = datetime.utcnow()
+    db_ok = True
+    db_error = None
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as e:
+        db_ok = False
+        db_error = str(e)
+
+    payload = {
+        "status": "ok" if db_ok else "degraded",
+        "service": "talentfitai-api",
+        "timestamp": started.isoformat() + "Z",
+        "uptime_seconds": round(time.monotonic() - PROCESS_START, 1),
+        "checks": {
+            "database": "ok" if db_ok else "error",
+            "llm_model": GROQ_MODEL,
+            "groq_key": "set" if os.getenv("GROQ_API_KEY") else "missing",
+            "active_sessions": len(ACTIVE_SESSIONS),
+        },
+    }
+    if db_error:
+        payload["checks"]["database_error"] = db_error
+
+    # 503 on a bad DB so uptime monitors and Render's health check actually
+    # register the failure instead of seeing a cheerful 200.
+    return JSONResponse(status_code=200 if db_ok else 503, content=payload)
