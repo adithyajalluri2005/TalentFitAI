@@ -16,6 +16,10 @@ services:
         value: /app/jds.db
       - key: GROQ_API_KEY
         sync: false        # set in the Render dashboard
+      - key: BRAVE_API_KEY
+        sync: false        # optional: backup web + video search when free search is blocked
+      - key: TAVILY_API_KEY
+        sync: false        # optional: second backup web search
       - key: GITHUB_TOKEN
         sync: false        # optional: raises GitHub search limit
       - key: CORS_ORIGINS

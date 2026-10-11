@@ -364,3 +364,60 @@ def test_daily_quota_switches_to_fallback_model_without_waiting():
     assert out.summary == "summary"
     assert primary.calls == 1 and backup.calls == ["_Summary"]
     assert _time.time() - t < 1          # no backoff sleeps for a daily limit
+
+
+def _search_with(brave="", tavily=""):
+    from src.langgraphagenticai.coach.search import SourceSearch
+    return SourceSearch(github_token="", brave_key=brave, tavily_key=tavily)
+
+
+def test_web_search_falls_back_ddgs_then_brave_then_tavily(monkeypatch):
+    s = _search_with(brave="b", tavily="t")
+    calls = []
+    hit = lambda name: [{"title": f"{name} doc", "url": f"https://docs.python.org/{name}", "body": "x"}]
+    monkeypatch.setattr(s, "_web_ddgs", lambda q, site, n: calls.append("ddgs") or [])
+    monkeypatch.setattr(s, "_web_brave", lambda q, site, n: calls.append("brave") or [])
+    monkeypatch.setattr(s, "_web_tavily", lambda q, site, n: calls.append("tavily") or hit("tavily"))
+    out = s.web("python typing")
+    assert calls == ["ddgs", "brave", "tavily"] and out[0]["url"].endswith("/tavily")
+
+    calls.clear()
+    monkeypatch.setattr(s, "_web_brave", lambda q, site, n: calls.append("brave") or hit("brave"))
+    assert s.web("python typing")[0]["url"].endswith("/brave") and calls == ["ddgs", "brave"]  # tavily untouched
+
+
+def test_backup_providers_skipped_without_keys():
+    s = _search_with()
+    assert s._web_brave("q", "", 5) == [] and s._web_tavily("q", "", 5) == [] and s._videos_brave("q", 5) == []
+    assert s.providers["web"] == ["ddgs"]
+    assert _search_with(brave="b", tavily="t").providers["web"] == ["ddgs", "brave", "tavily"]
+
+
+def test_ddgs_circuit_breaker_stops_retrying_a_blocked_provider(monkeypatch):
+    import src.langgraphagenticai.coach.search as search_mod
+    monkeypatch.setattr(search_mod.time, "sleep", lambda s: None)
+    s = _search_with(tavily="t")
+    attempts = []
+
+    def blocked(*a, **k):
+        attempts.append(1)
+        raise RuntimeError("h2 connection driver error: connection reset")
+    monkeypatch.setattr(s._ddgs, "text", blocked)
+    for _ in range(3):
+        s._web_ddgs("q", "", 5)
+    before = len(attempts)
+    assert s._web_ddgs("q", "", 5) == [] and len(attempts) == before   # breaker open: no more attempts
+
+
+def test_videos_fall_back_to_brave(monkeypatch):
+    s = _search_with(brave="b")
+    monkeypatch.setattr(s, "_videos_ytdlp", lambda q, n: [])
+    monkeypatch.setattr(search_mod_http := __import__("src.langgraphagenticai.coach.search", fromlist=["x"]), "_http_json",
+                        lambda url, headers, body=None: {"results": [
+                            {"title": "Asyncio Tutorial - YouTube", "url": "https://www.youtube.com/watch?v=a",
+                             "video": {"duration": "25:10", "views": 478000, "creator": "Tech With Tim"}},
+                            {"title": "short", "url": "https://www.youtube.com/watch?v=b", "video": {"duration": "1:30"}},
+                            {"title": "not yt", "url": "https://vimeo.com/1", "video": {"duration": "30:00"}}]})
+    out = s.videos("python asyncio")
+    assert [v["url"] for v in out] == ["https://www.youtube.com/watch?v=a"]
+    assert out[0]["title"] == "Asyncio Tutorial" and out[0]["meta"] == "Tech With Tim · 25 min · 478K views"
