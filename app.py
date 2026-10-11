@@ -100,8 +100,8 @@ async def health():
             "llm_fallback_model": GROQ_FALLBACK_MODEL,
             "groq_key": "set" if os.getenv("GROQ_API_KEY") else "missing",
             # Free providers first; keyed ones are backups (see coach/search.py).
-            "search_web": ["ddgs"] + [name for name, key in (("brave", "BRAVE_API_KEY"), ("tavily", "TAVILY_API_KEY")) if os.getenv(key)],
-            "search_videos": ["yt-dlp"] + (["brave"] if os.getenv("BRAVE_API_KEY") else []),
+            "search_web": ["ddgs"] + (["tavily"] if os.getenv("TAVILY_API_KEY") else []),
+            "search_videos": ["yt-dlp"],
         },
     }
     if db_error:

@@ -1,9 +1,9 @@
 """Source search for study plans, free providers first.
 
-- Web pages: `ddgs` (metasearch, no API key), falling back to the Brave Search
-  API and then Tavily when their keys are set (BRAVE_API_KEY, TAVILY_API_KEY).
-  Free metasearch is often blocked from cloud servers; the fallbacks cover that.
-- YouTube videos: yt-dlp search (no key), falling back to Brave video search.
+- Web pages: `ddgs` (metasearch, no API key), falling back to Tavily when
+  TAVILY_API_KEY is set. Free metasearch is often blocked from cloud servers;
+  the fallback covers that.
+- YouTube videos: yt-dlp search (no key).
 - GitHub repositories: GitHub's REST search API (no key needed; set
   GITHUB_TOKEN to raise the rate limit from 10 to 30 searches/minute).
 
@@ -157,39 +157,29 @@ def _http_json(url: str, headers: dict, body: Optional[dict] = None, timeout: in
         return json.load(resp)
 
 
-def _clock_seconds(text: str) -> int:
-    """'1:02:03' / '12:34' -> seconds."""
-    total = 0
-    for part in re.findall(r"\d+", text or ""):
-        total = total * 60 + int(part)
-    return total
-
 
 class SourceSearch:
-    """Web + video search with free-first fallbacks:
+    """Web + video search, free providers first:
 
-        web:    ddgs (free, no key) -> Brave Search API -> Tavily API
-        videos: yt-dlp (free, no key) -> Brave video search
+        web:    ddgs (free, no key) -> Tavily API
+        videos: yt-dlp (free, no key)
 
-    Brave and Tavily are used only when their keys are set (BRAVE_API_KEY,
-    TAVILY_API_KEY) and only when the providers before them fail or return
-    nothing, which keeps their monthly free quotas for when they're needed.
+    Tavily is used only when TAVILY_API_KEY is set and ddgs fails or returns
+    nothing, which keeps its monthly free quota for when it's needed.
     """
 
-    def __init__(self, github_token: Optional[str] = None,
-                 brave_key: Optional[str] = None, tavily_key: Optional[str] = None):
+    def __init__(self, github_token: Optional[str] = None, tavily_key: Optional[str] = None):
         from ddgs import DDGS
         self._ddgs = DDGS(timeout=15)
         self._github_token = github_token if github_token is not None else os.getenv("GITHUB_TOKEN", "")
-        self._brave_key = (brave_key if brave_key is not None else os.getenv("BRAVE_API_KEY", "")).strip()
         self._tavily_key = (tavily_key if tavily_key is not None else os.getenv("TAVILY_API_KEY", "")).strip()
         self._ddgs_breaker = _Breaker()
         self._ytdlp_breaker = _Breaker()
 
     @property
     def providers(self) -> dict:
-        return {"web": ["ddgs"] + (["brave"] if self._brave_key else []) + (["tavily"] if self._tavily_key else []),
-                "videos": ["yt-dlp"] + (["brave"] if self._brave_key else []),
+        return {"web": ["ddgs"] + (["tavily"] if self._tavily_key else []),
+                "videos": ["yt-dlp"],
                 "github": ["github-api" + (" (token)" if self._github_token else "")]}
 
     # ---------------- raw web providers: -> [{title, url, body}] ---------------- #
@@ -211,20 +201,6 @@ class SourceSearch:
         logger.info("ddgs failed for %r: %s", query, last)
         return []
 
-    def _web_brave(self, q: str, site: str, n: int) -> List[dict]:
-        if not self._brave_key:
-            return []
-        query = f"{q} site:{site}" if site else q
-        try:
-            data = _http_json("https://api.search.brave.com/res/v1/web/search?"
-                              + urllib.parse.urlencode({"q": query, "count": min(n, 20)}),
-                              {"X-Subscription-Token": self._brave_key})
-        except Exception as e:
-            logger.warning("brave search failed for %r: %s", query, e)
-            return []
-        return [{"title": r.get("title", ""), "url": r.get("url", ""), "body": re.sub(r"<[^>]+>", "", r.get("description", ""))}
-                for r in (data.get("web") or {}).get("results", [])]
-
     def _web_tavily(self, q: str, site: str, n: int) -> List[dict]:
         if not self._tavily_key:
             return []
@@ -242,7 +218,7 @@ class SourceSearch:
 
     def web(self, query: str, site: str = "", n: int = 6) -> List[dict]:
         out = []
-        for name, provider in (("ddgs", self._web_ddgs), ("brave", self._web_brave), ("tavily", self._web_tavily)):
+        for name, provider in (("ddgs", self._web_ddgs), ("tavily", self._web_tavily)):
             raw = provider(query, site, n)
             for r in raw:
                 url, title = r.get("url") or "", (r.get("title") or "").strip()
@@ -285,33 +261,10 @@ class SourceSearch:
                                   int(e.get("view_count") or 0), e.get("channel") or "", e.get("description"))
                 for e in entries]
 
-    def _videos_brave(self, query: str, n: int) -> List[dict]:
-        if not self._brave_key:
-            return []
-        try:
-            data = _http_json("https://api.search.brave.com/res/v1/videos/search?"
-                              + urllib.parse.urlencode({"q": query, "count": min(n, 20)}),
-                              {"X-Subscription-Token": self._brave_key})
-        except Exception as e:
-            logger.warning("brave video search failed for %r: %s", query, e)
-            return []
-        out = []
-        for r in data.get("results", []):
-            v = r.get("video") or {}
-            out.append(self._video_entry(r.get("title"), r.get("url") or "", _clock_seconds(v.get("duration", "")),
-                                         int(v.get("views") or 0), v.get("creator") or v.get("publisher") or "",
-                                         r.get("description")))
-        return out
-
     def videos(self, query: str, n: int = 8, min_seconds: int = MIN_VIDEO_SECONDS) -> List[dict]:
         """YouTube results (metadata only; nothing is downloaded)."""
-        for name, provider in (("yt-dlp", self._videos_ytdlp), ("brave", self._videos_brave)):
-            out = [v for v in provider(query, n)
-                   if v["url"].startswith("https://www.youtube.com/watch") and not (v["_secs"] and v["_secs"] < min_seconds)]
-            if out:
-                if name != "yt-dlp":
-                    logger.info("video search for %r served by %s", query, name)
-                break
+        out = [v for v in self._videos_ytdlp(query, n)
+               if v["url"].startswith("https://www.youtube.com/watch") and not (v["_secs"] and v["_secs"] < min_seconds)]
         # Popularity is a decent proxy for a clear, accurate video.
         out.sort(key=lambda v: v["_views"], reverse=True)
         for v in out:
