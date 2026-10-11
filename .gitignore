@@ -3,3 +3,8 @@ __pycache__
 node_modules
 
 
+
+# SQLite runtime data (sessions, progress); recreated and re-seeded on start
+*.db
+*.db-shm
+*.db-wal

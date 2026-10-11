@@ -3,23 +3,16 @@ fastapi
 uvicorn[standard]
 python-multipart          # required by FastAPI for UploadFile / Form
 pydantic
-sqlalchemy
 python-dotenv
 
 # --- LLM / agent stack ---
-langchain
-langgraph
-langchain_community
 langchain_core
 langchain_groq
+langgraph
+langgraph-checkpoint-sqlite   # durable coaching sessions (they span days)
 groq                      # used directly for Whisper transcription
-tavily-python
+ddgs                      # free web search for study sources (no API key)
+yt-dlp                    # free YouTube search for study videos (metadata only)
 
-# --- NLP / matching ---
-# No sentence-transformers/torch on purpose: embeddings come from the HF
-# Inference API (see nodes.py get_embedding), which keeps this under a 512MB tier.
-scikit-learn
-nltk
-numpy
+# --- Resume parsing ---
 pypdf
-httpx

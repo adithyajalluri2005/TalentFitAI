@@ -16,9 +16,7 @@ services:
         value: /app/jds.db
       - key: GROQ_API_KEY
         sync: false        # set in the Render dashboard
-      - key: TAVILY_API_KEY
-        sync: false
-      - key: HF_TOKEN
-        sync: false        # required for embeddings
+      - key: GITHUB_TOKEN
+        sync: false        # optional: raises GitHub search limit
       - key: CORS_ORIGINS
         sync: false        # e.g. https://frontend-jade-six-87.vercel.app
