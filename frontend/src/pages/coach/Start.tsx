@@ -7,7 +7,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Slider } from '@/components/ui/slider';
 import { Badge } from '@/components/ui/badge';
 import { useToast } from '@/hooks/use-toast';
 import {
@@ -21,7 +20,6 @@ const START_STAGES = [
   'Rating each skill against the role…',
   'Picking topics and searching for the best sources…',
   'Curating sources…',
-  'Writing your first checkpoint…',
 ];
 
 export default function Start() {
@@ -37,7 +35,6 @@ export default function Start() {
   const [roleSlug, setRoleSlug] = useState<string | null>(null);
   const [jdText, setJdText] = useState('');
   const [jdRole, setJdRole] = useState('');
-  const [turns, setTurns] = useState(5);
   const [starting, setStarting] = useState(false);
   const [stage, setStage] = useState(0);
 
@@ -96,7 +93,6 @@ export default function Start() {
         roleSlug: mode === 'role' ? roleSlug! : undefined,
         jdText: mode === 'jd' ? jdText : undefined,
         targetRole: mode === 'jd' ? jdRole : undefined,
-        interviewTurns: turns,
       });
       rememberSession({ threadId: view.thread_id, role: view.state.target_role, startedAt: new Date().toISOString() });
       navigate(`/session/${view.thread_id}/plan`);
@@ -246,19 +242,6 @@ export default function Start() {
               </div>
             </TabsContent>
           </Tabs>
-        </CardContent>
-      </Card>
-
-      {/* Step 3 */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">3. Mock interview</CardTitle>
-        </CardHeader>
-        <CardContent className="max-w-sm">
-          <div className="space-y-3">
-            <Label>Mock interview length: <span className="font-semibold">{turns} questions</span></Label>
-            <Slider min={2} max={8} step={1} value={[turns]} onValueChange={([v]) => setTurns(v)} />
-          </div>
         </CardContent>
       </Card>
 

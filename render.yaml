@@ -16,8 +16,14 @@ services:
         value: /app/jds.db
       - key: GROQ_API_KEY
         sync: false        # set in the Render dashboard
+      - key: GROQ_API_KEY_1
+        sync: false        # optional: extra Groq keys, each with its own quota; used when the others are rate limited
+      - key: GROQ_API_KEY_2
+        sync: false
+      - key: LANGSEARCH_API_KEY
+        sync: false        # required: web search for study sources and interview questions (free: 1,000/day)
       - key: TAVILY_API_KEY
-        sync: false        # optional: backup web search when free search is blocked
+        sync: false        # optional: backup web search when LangSearch fails
       - key: GITHUB_TOKEN
         sync: false        # optional: raises GitHub search limit
       - key: CORS_ORIGINS

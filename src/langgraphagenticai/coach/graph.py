@@ -1,8 +1,11 @@
-"""The coaching loop as a single cyclic LangGraph.
+"""The coaching session as a LangGraph.
 
-    diagnose -> plan -> [make_checkpoint -> await_checkpoint* -> grade_checkpoint]... ->
-    [interview_ask -> await_answer* -> interview_eval]... -> critic -> rescore -> summarize
-    -> END (ready / out of cycles) | plan (next cycle)
+    diagnose -> plan -> [await_study* -> make_checkpoint -> await_checkpoint* -> grade_checkpoint]... ->
+    [interview_ask -> await_answer* -> interview_eval]... -> critic -> rescore -> summarize ->
+    [await_study* -> make_checkpoint -> await_checkpoint* -> grade_checkpoint]... -> END ('finish')
+
+One interview per session. Assessments can be taken and retaken before it
+and after it; after it, each one re-scores readiness.
 
     * pauses the graph with interrupt(); resume with Command(resume=<reply>).
 """
@@ -21,16 +24,31 @@ from src.langgraphagenticai.coach.state import CoachState
 logger = logging.getLogger(__name__)
 
 
+def _serde():
+    """Checkpoint serializer that knows the session's own types. LangGraph
+    warns that unregistered types in a checkpoint will be refused in a future
+    version, which would make saved sessions impossible to resume."""
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from src.langgraphagenticai.coach import state as S
+    types = [S.RoleSkill, S.Observation, S.SkillLevel, S.Resource, S.Topic, S.SkillTopics, S.QuizQuestion,
+             S.QuizReview, S.CheckpointResult, S.RubricScore, S.InterviewTurn, S.ReadinessSnapshot, S.CoachState]
+    try:
+        return JsonPlusSerializer(allowed_msgpack_modules=types)
+    except TypeError:  # older langgraph-checkpoint without the allowlist
+        return None
+
+
 def make_checkpointer(db_path: Optional[str]):
     """SQLite-backed so a coaching session survives restarts (sessions span
     days); falls back to memory if the sqlite saver is not installed."""
+    serde = _serde()
     if db_path:
         try:
             from langgraph.checkpoint.sqlite import SqliteSaver
-            return SqliteSaver(sqlite3.connect(db_path, check_same_thread=False))
+            return SqliteSaver(sqlite3.connect(db_path, check_same_thread=False), serde=serde)
         except ImportError:
             logger.warning("langgraph-checkpoint-sqlite not installed; coaching sessions will not survive restarts")
-    return MemorySaver()
+    return MemorySaver(serde=serde)
 
 
 class CoachGraph:
@@ -43,6 +61,7 @@ class CoachGraph:
         g = StateGraph(CoachState)
         g.add_node("diagnose", n.diagnose)
         g.add_node("plan", n.plan)
+        g.add_node("await_study", n.await_study)
         g.add_node("make_checkpoint", n.make_checkpoint)
         g.add_node("await_checkpoint", n.await_checkpoint)
         g.add_node("grade_checkpoint", n.grade_checkpoint)
@@ -55,19 +74,23 @@ class CoachGraph:
 
         g.add_edge(START, "diagnose")
         g.add_edge("diagnose", "plan")
-        learning = {"make_checkpoint": "make_checkpoint", "interview_ask": "interview_ask"}
+        learning = {"await_study": "await_study", "interview_ask": "interview_ask"}
         g.add_conditional_edges("plan", n.route_learning, learning)
+        g.add_conditional_edges("await_study", n.route_after_study, {
+            "make_checkpoint": "make_checkpoint", "await_study": "await_study", "interview_ask": "interview_ask",
+            "end": END})
         g.add_edge("make_checkpoint", "await_checkpoint")
         g.add_conditional_edges("await_checkpoint", n.route_after_await,
                                 {"make_checkpoint": "make_checkpoint", "grade_checkpoint": "grade_checkpoint"})
         g.add_conditional_edges("grade_checkpoint", n.route_learning, learning)
         g.add_edge("interview_ask", "await_answer")
-        g.add_edge("await_answer", "interview_eval")
+        g.add_conditional_edges("await_answer", n.route_after_answer,
+                                {"interview_eval": "interview_eval", "critic": "critic"})
         g.add_conditional_edges("interview_eval", n.route_interview,
                                 {"interview_ask": "interview_ask", "critic": "critic"})
         g.add_edge("critic", "rescore")
         g.add_edge("rescore", "summarize")
-        g.add_conditional_edges("summarize", n.route_after_cycle, {"plan": "plan", "end": END})
+        g.add_conditional_edges("summarize", n.route_after_summary, {"await_study": "await_study", "end": END})
         return g
 
     # ---------------- runtime ---------------- #
@@ -75,7 +98,7 @@ class CoachGraph:
     @staticmethod
     def _cfg(thread_id: str) -> dict:
         # Each interview turn is ~3 supersteps and checkpoints ~3 per skill;
-        # the default limit of 25 would stop a long session mid-cycle.
+        # the default limit of 25 would stop a long session midway.
         return {"configurable": {"thread_id": thread_id}, "recursion_limit": 200}
 
     def start(self, thread_id: str, state: CoachState) -> dict:
@@ -105,17 +128,22 @@ class CoachGraph:
 
     def view(self, thread_id: str) -> Optional[dict]:
         """Client-safe view of a session: state plus whatever the graph is
-        waiting for. Quiz answers are stripped so they cannot be read early."""
+        waiting for. Quiz answers and the key points of an unanswered
+        interview question are stripped so they cannot be read early."""
         snap = self.graph.get_state(self._cfg(thread_id))
         if not snap.values:
             return None
         state = CoachState.model_validate(snap.values)
         pending = next((t.interrupts[0].value for t in snap.tasks if t.interrupts), None)
+        dumped = state.model_dump(exclude={"current_quiz", "resume_text", "jd_text"})
+        for turn in dumped["interview"]:
+            if turn["answer"] is None:
+                turn["key_points"] = []
         return {
             "thread_id": thread_id,
             "waiting_for": pending,
             "done": not snap.next,
             # Live estimate (moves with checkpoints); history holds the official re-scores.
             "readiness": scoring.readiness(state.skills),
-            "state": state.model_dump(exclude={"current_quiz", "resume_text", "jd_text"}),
+            "state": dumped,
         }

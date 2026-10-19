@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { CheckCircle2, Loader2, MessageSquareQuote, Trophy, TrendingUp } from 'lucide-react';
+import { CheckCircle2, Loader2, RotateCcw, Trophy, TrendingUp, XCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -8,9 +8,9 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import {
-  coachApi, errorMessage, CheckpointPrompt, InterviewTurn, RespondPayload, SessionView,
+  coachApi, errorMessage, CheckpointPrompt, CheckpointResult, RespondPayload, SessionView,
 } from '@/services/coach';
-import { ReadinessRing, SkillRow } from './components';
+import { CodeText, ReadinessRing, SkillRow, SourceLink } from './components';
 import SkillGapView from './SkillGapView';
 import InterviewRoom from './InterviewRoom';
 import { cn } from '@/lib/utils';
@@ -25,6 +25,7 @@ const TAB_TITLE: Record<Tab, string> = {
 
 /** Which tab the session's current step lives on. */
 function tabFor(view: SessionView): Tab {
+  // 'study' (no quiz requested yet) lives on the plan tab.
   if (view.waiting_for?.type === 'checkpoint') return 'checkpoints';
   if (view.waiting_for?.type === 'interview_question') return 'interview';
   return 'plan';
@@ -40,7 +41,6 @@ export default function Session() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
-  const [forceQuiz, setForceQuiz] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -76,9 +76,14 @@ export default function Session() {
       const before = view?.state.history.length ?? 0;
       const next = await coachApi.respond(threadId, payload);
       setView(next);
-      // A finished cycle shows its recap on the plan tab; otherwise follow the
-      // graph to wherever it is now waiting.
-      const target = next.state.history.length > before ? 'plan' : tabFor(next);
+      // A finished session shows its recap on the plan tab; otherwise follow
+      // the graph to wherever it is now waiting.
+      // After a submitted quiz, stay on the Assessments tab so its results show.
+      const graded = !!payload.answers && next.waiting_for?.type === 'study';
+      // The last interview answer opens the results on the interview tab.
+      const interviewEnded = (payload.answer !== undefined || (tab === 'interview' && (payload.action === 'skip' || payload.action === 'end')))
+        && next.state.history.length > before;
+      const target = graded ? 'checkpoints' : interviewEnded ? 'interview' : tabFor(next);
       if (target !== tab) navigate(`/session/${threadId}/${target}`);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (e) {
@@ -112,20 +117,38 @@ export default function Session() {
 
   const { state, waiting_for: waiting } = view;
   const lastSnapshot = state.history[state.history.length - 1];
-  const turnsThisCycle = state.interview.slice(state.cycle * state.interview_turns);
-  const answered = turnsThisCycle.filter((t) => t.score);
-  const lastAnswered = answered[answered.length - 1];
-  const showCycleRecap = !!lastSnapshot && (view.done || turnsThisCycle.length === 0);
+  // One interview per session; after it, assessments stay open until the session is ended.
+  const interviewDone = state.status === 'ready' || state.status === 'finished';
+  const showRecap = !!lastSnapshot && (view.done || interviewDone);
+  const finish = () => respond({ action: 'finish' });
   const goTo = (t: Tab) => navigate(`/session/${threadId}/${t}`);
   const topicsFor = (skill: string) => state.plan.find((p) => p.skill === skill)?.topics.length ?? 0;
-  const isReady = (skill: string) => (view.topic_done?.[skill]?.length ?? 0) >= topicsFor(skill);
-  // Open this skill's assessment; if another skill's quiz is pending, switch to this one first.
+  // Open this skill's assessment. Quizzes are only written on request, so this
+  // asks for one (or switches from another skill's open quiz).
   const assess = (skill: string) => {
-    // Go to the Assessments tab first so its "thinking" state shows while a new quiz is written.
+    // Go to the Assessments tab first so its "preparing" state shows while the quiz is written.
     goTo('checkpoints');
-    if (!(waiting?.type === 'checkpoint' && waiting.skill === skill)) respond({ action: 'switch', skill });
+    if (waiting?.type === 'study') respond({ action: 'assess', skill });
+    else if (waiting?.type === 'checkpoint' && waiting.skill !== skill) respond({ action: 'switch', skill });
+  };
+  // Take an already-assessed skill's assessment again; the new score replaces the old one.
+  const retake = (skill: string) => {
+    goTo('checkpoints');
+    if (waiting?.type === 'study') respond({ action: 'retake', skill });
+  };
+  // Every assessment is done: write the first interview question and open the interview.
+  const startInterview = () => {
+    goTo('interview');
+    if (waiting?.type === 'study') respond({ action: 'interview' });
   };
 
+  const preparing = (
+    <Card><CardContent className="py-16 flex flex-col items-center gap-3 text-muted-foreground">
+      <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      <span>Preparing your assessment…</span>
+      <span className="text-xs">This takes a few seconds, up to half a minute for a skill's first assessment.</span>
+    </CardContent></Card>
+  );
   const thinking = (
     <Card><CardContent className="py-16 flex flex-col items-center gap-3 text-muted-foreground">
       <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -141,15 +164,13 @@ export default function Session() {
           <h1 className="text-2xl font-bold text-foreground">{TAB_TITLE[tab]}</h1>
           <div className="text-muted-foreground mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="font-medium text-foreground">{state.target_role}</span>
-            <span aria-hidden>·</span>
-            <span>Cycle {state.cycle + 1} of {state.max_cycles}</span>
             <Badge variant="secondary" className="font-normal">{statusLabel(view)}</Badge>
           </div>
         </div>
 
         {tab === 'plan' && (
           <>
-            {showCycleRecap && <CycleRecap view={view} />}
+            {showRecap && <SessionRecap view={view} onRetake={view.done ? undefined : () => goTo('checkpoints')} onFinish={view.done ? undefined : finish} />}
             {refreshing ? (
               <Card><CardContent className="py-16 flex flex-col items-center gap-3 text-muted-foreground text-sm">
                 <Loader2 className="h-6 w-6 animate-spin text-primary" />
@@ -160,37 +181,57 @@ export default function Session() {
                 view={view}
                 onTick={view.done ? undefined : tickTopic}
                 onAssess={view.done ? undefined : assess}
-                onInterview={() => goTo('interview')}
+                onRetake={view.done ? undefined : retake}
+                onInterview={waiting?.type === 'interview_question' ? () => goTo('interview') : startInterview}
+                interviewDone={interviewDone}
+                onViewResults={() => goTo('interview')}
+                onFinish={view.done ? undefined : finish}
               />
             )}
           </>
         )}
 
         {tab === 'checkpoints' && (
-          busy ? thinking : waiting?.type === 'checkpoint' ? (
-            isReady(waiting.skill) ? (
-              <>
-                <QuizPanel key={`${state.cycle}-${waiting.skill}`} prompt={waiting} onSubmit={respond} />
-                {state.checkpoints.length > 0 && <LastCheckpoint result={state.checkpoints[state.checkpoints.length - 1]} />}
-              </>
-            ) : (
-              <AssessmentGate
-                pending={waiting.pending ?? [waiting.skill]}
-                current={waiting.skill}
-                progress={(sk) => [view.topic_done?.[sk]?.length ?? 0, topicsFor(sk)]}
-                onAssess={assess}
-                onStudy={() => goTo('plan')}
-                onTakeAnyway={() => setForceQuiz(waiting.skill)}
-                onSkipAll={() => respond({ action: 'skip_all' })}
-                forced={forceQuiz === waiting.skill}
-                quiz={<QuizPanel key={`${state.cycle}-${waiting.skill}`} prompt={waiting} onSubmit={respond} />}
-              />
-            )
+          busy ? preparing : waiting?.type === 'checkpoint' ? (
+            <>
+              <QuizPanel key={`${state.checkpoints.length}-${waiting.skill}`} prompt={waiting} onSubmit={respond} />
+              {state.checkpoints.length > 0 && <LastCheckpoint result={state.checkpoints[state.checkpoints.length - 1]} />}
+            </>
+          ) : waiting?.type === 'study' ? (
+            <>
+              {/* The usual view right after submitting a quiz. */}
+              {state.checkpoints.length > 0 && <LastCheckpoint result={state.checkpoints[state.checkpoints.length - 1]} defaultOpen />}
+              {waiting.pending.length > 0 ? (
+                <AssessmentGate
+                  pending={waiting.pending}
+                  progress={(sk) => [view.topic_done?.[sk]?.length ?? 0, topicsFor(sk)]}
+                  onAssess={assess}
+                  onStudy={() => goTo('plan')}
+                  onSkipAll={interviewDone ? undefined : () => respond({ action: 'skip_all' })}
+                  onFinish={interviewDone ? finish : undefined}
+                />
+              ) : interviewDone ? (
+                <Placeholder
+                  text="Your interview is done. Retake any assessment to raise your readiness, or end the session when you're finished."
+                  action={{ label: 'End session', onClick: finish }}
+                  secondary={{ label: 'View interview results', onClick: () => goTo('interview') }}
+                />
+              ) : (
+                <Placeholder
+                  text="All skill assessments are done. Retake any of them to improve your score, or start the final interview."
+                  action={{ label: 'Start final interview', onClick: startInterview }}
+                />
+              )}
+              <RetakeList skills={waiting.retakeable ?? []} checkpoints={state.checkpoints} onRetake={retake} />
+            </>
           ) : (
-            <Placeholder
-              text={view.done ? 'This coaching session is complete.' : 'All skill assessments for this cycle are done.'}
-              action={!view.done && waiting?.type === 'interview_question' ? { label: 'Start final interview', onClick: () => goTo('interview') } : undefined}
-            />
+            <>
+              {state.checkpoints.length > 0 && <LastCheckpoint result={state.checkpoints[state.checkpoints.length - 1]} />}
+              <Placeholder
+                text={view.done ? 'This coaching session is complete.' : 'All skill assessments are done.'}
+                action={!view.done && waiting?.type === 'interview_question' ? { label: 'Start final interview', onClick: () => goTo('interview') } : undefined}
+              />
+            </>
           )
         )}
 
@@ -198,10 +239,17 @@ export default function Session() {
           waiting?.type === 'interview_question' ? (
             // Kept mounted while the coach thinks, so the camera stays on between questions.
             <>
-              {lastAnswered && !busy && <TurnFeedback turn={lastAnswered} />}
               <InterviewRoom prompt={waiting} onSubmit={respond} busy={busy} />
             </>
-          ) : busy ? thinking : waiting?.type === 'checkpoint' ? (
+          ) : busy ? thinking : showRecap ? (
+            <SessionRecap view={view} reviewOpen onRetake={view.done ? undefined : () => goTo('checkpoints')} onFinish={view.done ? undefined : finish} />
+          ) : waiting?.type === 'study' && waiting.pending.length === 0 ? (
+            <Placeholder
+              text="Every skill assessment is done. Start the final interview when you're ready; until then you can still retake assessments."
+              action={{ label: 'Start final interview', onClick: startInterview }}
+              secondary={{ label: 'Back to Skill Gap & Topics', onClick: () => goTo('plan') }}
+            />
+          ) : waiting?.type === 'checkpoint' || waiting?.type === 'study' ? (
             <Placeholder
               text="The final interview opens after every skill assessment. Finish your topics and assessments first, or skip straight to the interview."
               action={{ label: 'Go to Skill Gap & Topics', onClick: () => goTo('plan') }}
@@ -222,6 +270,8 @@ export default function Session() {
             {state.history.length > 0 && (
               <p className="text-xs text-muted-foreground">
                 Re-scores: {state.history.map((h) => `${Math.round(h.readiness)}%`).join(' → ')}
+                {Math.round(view.readiness) !== Math.round(state.history[state.history.length - 1].readiness) &&
+                  ` · now ${Math.round(view.readiness)}% (live, official at session end)`}
               </p>
             )}
             <Button variant="ghost" size="sm" asChild>
@@ -266,8 +316,10 @@ function Placeholder({ text, action, secondary }: {
 function statusLabel(view: SessionView): string {
   if (view.state.status === 'ready') return 'Interview-ready 🎉';
   if (view.done) return 'Coaching complete';
+  if (view.state.status === 'finished') return 'Interview done · assessments still open';
   const w = view.waiting_for;
   if (w?.type === 'checkpoint') return `Next: ${w.skill} assessment`;
+  if (w?.type === 'study') return 'Study your topics, then take the assessments';
   if (w?.type === 'interview_question') return `Next: interview question ${w.turn} of ${w.of}`;
   return 'Working…';
 }
@@ -290,7 +342,8 @@ function QuizPanel({ prompt, onSubmit }: { prompt: CheckpointPrompt; onSubmit: (
       <CardContent className="space-y-6">
         {prompt.questions.map((q, i) => (
           <div key={i} className="space-y-2">
-            <p className="font-medium text-sm">{i + 1}. {q.question}</p>
+            <CodeText className="font-medium text-sm" text={`${i + 1}. ${q.question}`} />
+            <SourceLink name={q.source_name} url={q.source_url} />
             <RadioGroup
               value={answers[i] !== undefined ? String(answers[i]) : ''}
               onValueChange={(v) => setAnswers((a) => a.map((x, j) => (j === i ? Number(v) : x)))}
@@ -298,15 +351,17 @@ function QuizPanel({ prompt, onSubmit }: { prompt: CheckpointPrompt; onSubmit: (
               {q.options.map((o, j) => (
                 <div key={j} className="flex items-start gap-2">
                   <RadioGroupItem value={String(j)} id={`q${i}o${j}`} className="mt-0.5" />
-                  <Label htmlFor={`q${i}o${j}`} className="font-normal text-sm leading-snug cursor-pointer">{o}</Label>
+                  <Label htmlFor={`q${i}o${j}`} className="font-normal text-sm leading-snug cursor-pointer"><CodeText text={o} /></Label>
                 </div>
               ))}
             </RadioGroup>
           </div>
         ))}
         <div className="flex flex-wrap gap-2 justify-end pt-2">
-          <Button variant="ghost" onClick={() => onSubmit({ action: 'skip_all' })}>Skip to mock interview</Button>
-          <Button variant="outline" onClick={() => onSubmit({ action: 'skip' })}>Skip this checkpoint</Button>
+          {!prompt.interview_done && (
+            <Button variant="ghost" onClick={() => onSubmit({ action: 'skip_all' })}>Skip to final interview</Button>
+          )}
+          <Button variant="outline" onClick={() => onSubmit({ action: 'skip' })}>Skip this assessment</Button>
           <Button disabled={!complete} onClick={() => onSubmit({ answers: answers as number[] })}>Submit answers</Button>
         </div>
       </CardContent>
@@ -314,58 +369,80 @@ function QuizPanel({ prompt, onSubmit }: { prompt: CheckpointPrompt; onSubmit: (
   );
 }
 
-function LastCheckpoint({ result }: { result: SessionView['state']['checkpoints'][number] }) {
+function LastCheckpoint({ result, defaultOpen = false }: { result: CheckpointResult; defaultOpen?: boolean }) {
   if (result.skipped) return null;
   const pct = Math.round(result.score * 100);
-  return (
-    <p className="text-sm text-muted-foreground flex items-center gap-2">
+  const summary = (
+    <span className="inline-flex items-center gap-2">
       <CheckCircle2 className={cn('h-4 w-4', pct >= 75 ? 'text-success' : 'text-warning')} />
-      Last checkpoint — {result.skill}: {pct}% correct. Your skill level was updated.
-    </p>
+      Last assessment — {result.skill}: {pct}% correct. Your skill level was updated.
+    </span>
   );
-}
-
-function TurnFeedback({ turn }: { turn: InterviewTurn }) {
-  const s = turn.score!;
+  if (!result.review?.length) return <p className="text-sm text-muted-foreground">{summary}</p>;
   return (
-    <Card className="bg-muted/40">
-      <CardContent className="pt-5 space-y-2">
-        <div className="flex items-center gap-2 text-sm font-medium">
-          <MessageSquareQuote className="h-4 w-4 text-primary" /> Feedback on your last answer
-        </div>
-        <div className="flex flex-wrap gap-2 text-xs">
-          <Badge variant="outline">Correctness {s.correctness}/5</Badge>
-          <Badge variant="outline">Depth {s.depth}/5</Badge>
-          <Badge variant="outline">Communication {s.communication}/5</Badge>
-        </div>
-        <p className="text-sm">{turn.feedback}</p>
-        {turn.needs_follow_up && !turn.is_follow_up && (
-          <p className="text-xs text-muted-foreground">Your coach will probe this point with a follow-up.</p>
-        )}
-      </CardContent>
-    </Card>
+    <details open={defaultOpen} className="text-sm rounded-lg border bg-muted/40 p-4">
+      <summary className="cursor-pointer text-muted-foreground">{summary} <span className="underline">Review answers</span></summary>
+      <ol className="mt-4 space-y-4">
+        {result.review.map((q, i) => {
+          const right = q.chosen === q.answer_index;
+          return (
+            <li key={i} className="space-y-1">
+              <div className="font-medium flex items-start gap-2">
+                {right
+                  ? <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0 text-success" />
+                  : <XCircle className="h-4 w-4 mt-0.5 shrink-0 text-destructive" />}
+                <CodeText className="min-w-0 flex-1" text={`${i + 1}. ${q.question}`} />
+              </div>
+              <div className="pl-6 space-y-1">
+                {!right && (
+                  <div className="text-muted-foreground flex gap-1">Your answer: <CodeText text={q.options[q.chosen] ?? '—'} /></div>
+                )}
+                <div className="flex gap-1">Correct answer: <CodeText className="font-medium" text={q.options[q.answer_index]} /></div>
+                {q.explanation && <p className="text-muted-foreground">{q.explanation}</p>}
+                <SourceLink name={q.source_name} url={q.source_url} label="Learn the answer" />
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </details>
   );
 }
 
-// ---------------- end of cycle ----------------
+function KeyPoints({ points }: { points: string[] }) {
+  if (!points?.length) return null;
+  return (
+    <div>
+      <p className="text-xs font-medium">A strong answer covers:</p>
+      <ul className="list-disc list-inside text-xs text-muted-foreground space-y-0.5">
+        {points.map((p, i) => <li key={i}>{p}</li>)}
+      </ul>
+    </div>
+  );
+}
 
-function CycleRecap({ view }: { view: SessionView }) {
+// ---------------- end of session ----------------
+
+function SessionRecap({ view, reviewOpen = false, onRetake, onFinish }: {
+  view: SessionView;
+  reviewOpen?: boolean;
+  /** shown while the session is open: assessments can still be retaken after the interview */
+  onRetake?: () => void;
+  onFinish?: () => void;
+}) {
   const { state } = view;
-  const h = state.history;
-  const last = h[h.length - 1];
-  const prev = h.length > 1 ? h[h.length - 2] : null;
+  const last = state.history[state.history.length - 1];
   const ready = state.status === 'ready';
-  const lastCycleTurns = state.interview.slice(last.cycle * state.interview_turns, (last.cycle + 1) * state.interview_turns);
   return (
     <Card className={cn(ready ? 'border-success' : 'border-primary/40')}>
       <CardHeader>
         <CardTitle className="text-lg flex items-center gap-2">
           {ready ? <Trophy className="h-5 w-5 text-success" /> : <TrendingUp className="h-5 w-5 text-primary" />}
-          {ready ? 'You are interview-ready!' : view.done ? 'Coaching complete' : `Cycle ${last.cycle + 1} results`}
+          {ready ? 'You are interview-ready!' : view.done ? 'Coaching complete' : 'Interview results'}
         </CardTitle>
         <CardDescription>
-          Readiness {Math.round(last.readiness)}%{prev && ` (${last.readiness >= prev.readiness ? '+' : ''}${Math.round(last.readiness - prev.readiness)} since last cycle)`}
-          {!view.done && ' — your plan has been updated for the next cycle.'}
+          Readiness {Math.round(last.readiness)}% (target {state.target_readiness}%)
+          {state.history.length > 1 && ` · was ${Math.round(state.history[0].readiness)}% right after the interview`}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -378,27 +455,45 @@ function CycleRecap({ view }: { view: SessionView }) {
             </ul>
           </div>
         )}
-        {lastCycleTurns.length > 0 && (
-          <details className="text-sm">
-            <summary className="cursor-pointer font-medium">Interview review ({lastCycleTurns.length} answers)</summary>
-            <div className="mt-3 space-y-4">
-              {lastCycleTurns.map((t, i) => (
-                <div key={i} className="space-y-1">
+        {state.interview.length > 0 && (
+          <details className="text-sm" open={reviewOpen}>
+            <summary className="cursor-pointer font-medium">Interview review ({state.interview.length} question{state.interview.length === 1 ? '' : 's'})</summary>
+            <div className="mt-3 space-y-3">
+              {state.interview.map((t, i) => (
+                <div key={i} className="space-y-1.5 rounded-lg border p-3">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <Badge variant="secondary">Q{i + 1}</Badge>
+                    <span className="text-muted-foreground">{t.skill}{t.is_follow_up ? ' · follow-up' : ''}</span>
+                    {t.score && (
+                      <Badge variant="outline" className={cn('ml-auto tabular-nums',
+                        avgScore(t.score) >= 3.5 ? 'text-success' : avgScore(t.score) >= 2.5 ? 'text-warning' : 'text-destructive')}>
+                        {avgScore(t.score).toFixed(1)} / 5
+                      </Badge>
+                    )}
+                  </div>
                   <p className="font-medium">{t.question}</p>
-                  <p className="text-muted-foreground italic">“{t.answer}”</p>
+                  {t.answer === 'SKIPPED' || t.answer === 'NO_ANSWER'
+                    ? <p className="text-muted-foreground text-sm">{t.answer === 'SKIPPED' ? 'Skipped' : 'No answer given'}</p>
+                    : <p className="text-muted-foreground italic">“{t.answer}”</p>}
                   {t.score && (
                     <p className="text-xs">Correctness {t.score.correctness} · Depth {t.score.depth} · Communication {t.score.communication}</p>
                   )}
                   <p>{t.feedback}</p>
                   {t.critic_note && <p className="text-xs text-muted-foreground">Score reviewed: {t.critic_note}</p>}
+                  <KeyPoints points={t.key_points} />
+                  <SourceLink name={t.source_name} url={t.source_url} label="Learn the answer" />
                 </div>
               ))}
             </div>
           </details>
         )}
-        {view.done && (
+        <div className="flex flex-wrap gap-2">
+          {onRetake && (
+            <Button onClick={onRetake}><RotateCcw className="h-4 w-4 mr-1.5" /> Retake assessments to improve</Button>
+          )}
+          {onFinish && <Button variant="outline" onClick={onFinish}>End session</Button>}
           <Button asChild variant="outline"><Link to="/start">Start another session</Link></Button>
-        )}
+        </div>
       </CardContent>
     </Card>
   );
@@ -412,18 +507,20 @@ function applyTick(done: Record<string, number[]>, skill: string, index: number,
 }
 
 /** Shown on the assessments tab while the pending skill's topics aren't all ticked. */
-function AssessmentGate({ pending, current, progress, onAssess, onStudy, onTakeAnyway, onSkipAll, forced, quiz }: {
+function AssessmentGate({ pending, progress, onAssess, onStudy, onSkipAll, onFinish }: {
   pending: string[];
-  current: string;
   progress: (skill: string) => [number, number];
   onAssess: (skill: string) => void;
   onStudy: () => void;
-  onTakeAnyway: () => void;
-  onSkipAll: () => void;
-  forced: boolean;
-  quiz: React.ReactNode;
+  /** omitted after the interview */
+  onSkipAll?: () => void;
+  /** after the interview: end the session without the pending assessments */
+  onFinish?: () => void;
 }) {
-  if (forced) return <>{quiz}</>;
+  const current = pending[0];
+  const [currentDone, currentTotal] = current ? progress(current) : [0, 0];
+  // Once its topics are all ticked, the skill's own "Take assessment" button covers it.
+  const currentReady = currentTotal > 0 && currentDone >= currentTotal;
   return (
     <Card>
       <CardHeader>
@@ -451,10 +548,53 @@ function AssessmentGate({ pending, current, progress, onAssess, onStudy, onTakeA
           );
         })}
         <div className="flex flex-wrap justify-end gap-2 pt-2">
-          <Button variant="ghost" size="sm" onClick={onSkipAll}>Skip to final interview</Button>
-          <Button variant="ghost" size="sm" onClick={onTakeAnyway}>Take {current} assessment anyway</Button>
+          {onSkipAll && <Button variant="ghost" size="sm" onClick={onSkipAll}>Skip to final interview</Button>}
+          {onFinish && <Button variant="ghost" size="sm" onClick={onFinish}>End session</Button>}
+          {!currentReady && (
+            <Button variant="ghost" size="sm" onClick={() => onAssess(current)}>Take {current} assessment anyway</Button>
+          )}
         </div>
       </CardContent>
     </Card>
   );
+}
+
+/** Assessments already taken, each with its latest score and a retake button. */
+function RetakeList({ skills, checkpoints, onRetake }: {
+  skills: string[];
+  checkpoints: CheckpointResult[];
+  onRetake: (skill: string) => void;
+}) {
+  if (!skills.length) return null;
+  const latest = new Map(checkpoints.map((c) => [c.skill, c] as const));
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base">Retake an assessment</CardTitle>
+        <CardDescription>You get new questions, and your latest score replaces the earlier one.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {skills.map((sk) => {
+          const r = latest.get(sk);
+          return (
+            <div key={sk} className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
+              <div className="flex-1 min-w-[10rem]">
+                <p className="text-sm font-medium">{sk}</p>
+                <p className="text-xs text-muted-foreground tabular-nums">
+                  {r?.skipped ? 'Skipped' : r ? `Last score ${Math.round(r.score * 100)}%` : ''}
+                </p>
+              </div>
+              <Button size="sm" variant="outline" onClick={() => onRetake(sk)}>
+                <RotateCcw className="h-3.5 w-3.5 mr-1.5" /> {r?.skipped ? 'Take assessment' : 'Retake'}
+              </Button>
+            </div>
+          );
+        })}
+      </CardContent>
+    </Card>
+  );
+}
+
+function avgScore(s: { correctness: number; depth: number; communication: number }) {
+  return (s.correctness + s.depth + s.communication) / 3;
 }

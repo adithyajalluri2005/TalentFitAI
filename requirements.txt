@@ -11,7 +11,6 @@ langchain_groq
 langgraph
 langgraph-checkpoint-sqlite   # durable coaching sessions (they span days)
 groq                      # used directly for Whisper transcription
-ddgs                      # free web search for study sources (no API key)
 yt-dlp                    # free YouTube search for study videos (metadata only)
 
 # --- Resume parsing ---

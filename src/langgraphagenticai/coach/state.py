@@ -70,6 +70,15 @@ class QuizQuestion(BaseModel):
     options: List[str]
     answer_index: int
     explanation: str = ""
+    # Set when the question comes from a web page; empty for model-written ones.
+    bank_id: str = ""
+    source_name: str = ""
+    source_url: str = ""
+
+
+class QuizReview(QuizQuestion):
+    """A graded quiz question, safe to show once the quiz is submitted."""
+    chosen: int
 
 
 class CheckpointResult(BaseModel):
@@ -77,6 +86,7 @@ class CheckpointResult(BaseModel):
     cycle: int
     score: float  # 0-1
     skipped: bool = False
+    review: List[QuizReview] = Field(default_factory=list)
 
 
 # ---------------- interview ---------------- #
@@ -96,6 +106,13 @@ class InterviewTurn(BaseModel):
     difficulty: int = Field(..., ge=1, le=5)
     question: str
     is_follow_up: bool = False
+    # Id of the web question the question was built on ("" if none), and what a
+    # strong answer covers; the grader scores against these.
+    bank_id: str = ""
+    key_points: List[str] = Field(default_factory=list)
+    # Page the question came from ("" if model-written); shown to the candidate.
+    source_name: str = ""
+    source_url: str = ""
     answer: Optional[str] = None
     voice_metrics: Dict[str, float] = Field(default_factory=dict)
     score: Optional[RubricScore] = None
@@ -122,9 +139,8 @@ class CoachState(BaseModel):
     role_slug: Optional[str] = None
     role_skills: List[RoleSkill] = Field(default_factory=list)
     jd_text: str = ""
-    target_readiness: float = 75
-    max_cycles: int = 3
-    interview_turns: int = 5
+    target_readiness: float = 90
+    interview_turns: int = 6  # main questions in the final interview; follow-ups are extra
 
     # --- diagnosis ---
     skills: List[SkillLevel] = Field(default_factory=list)
@@ -142,10 +158,21 @@ class CoachState(BaseModel):
 
     # --- interview ---
     interview: List[InterviewTurn] = Field(default_factory=list)
+    # Set when the candidate ends the interview before its last question.
+    interview_ended: bool = False
 
-    # --- loop / output ---
+    # --- output ---
+    # Sessions are a single pass, so this stays 0; kept for saved sessions and
+    # the cycle column of progress rows.
     cycle: int = 0
     history: List[ReadinessSnapshot] = Field(default_factory=list)
     summary: str = ""
     next_steps: List[str] = Field(default_factory=list)
     status: Literal["diagnosing", "learning", "interviewing", "ready", "finished"] = "diagnosing"
+    # Set when the candidate ends the session. After the interview they can
+    # keep taking and retaking assessments until then.
+    closed: bool = False
+
+    @property
+    def interview_done(self) -> bool:
+        return self.status in ("ready", "finished")

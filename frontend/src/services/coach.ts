@@ -48,18 +48,41 @@ export interface InterviewTurn {
   feedback: string;
   needs_follow_up: boolean;
   critic_note: string;
+  /** What a strong answer covers; empty until the question is answered. */
+  key_points: string[];
+  bank_id: string;
+  /** Web page the question comes from; empty for model-written questions. */
+  source_name: string;
+  source_url: string;
 }
 
 export interface ReadinessSnapshot { cycle: number; readiness: number; per_skill: Record<string, number>; at: string }
 
-export interface CheckpointResult { skill: string; cycle: number; score: number; skipped: boolean }
+export interface QuizReview {
+  question: string;
+  options: string[];
+  answer_index: number;
+  chosen: number;
+  explanation: string;
+  bank_id: string;
+  source_name: string;
+  source_url: string;
+}
+
+export interface CheckpointResult {
+  skill: string;
+  cycle: number;
+  score: number;
+  skipped: boolean;
+  /** Graded questions with answers and sources, filled once the quiz is submitted. */
+  review: QuizReview[];
+}
 
 export interface CoachState {
   candidate_id: string;
   target_role: string;
   role_slug?: string;
   target_readiness: number;
-  max_cycles: number;
   interview_turns: number;
   skills: SkillLevel[];
   plan: SkillTopics[];
@@ -78,7 +101,21 @@ export interface CheckpointPrompt {
   skill: string;
   pending: string[];
   topics: Topic[];
-  questions: { question: string; options: string[] }[];
+  /** source_url is empty for model-written questions */
+  questions: { question: string; options: string[]; source_name: string; source_url: string }[];
+  /** the interview already happened: no "skip to interview" */
+  interview_done?: boolean;
+}
+
+/** Studying: no quiz is written until the candidate asks for one ('assess'). */
+export interface StudyPrompt {
+  type: 'study';
+  /** Skills whose assessment is still to take, highest priority first. */
+  pending: string[];
+  /** Skills already assessed (or skipped) that can be taken again. */
+  retakeable: string[];
+  /** After the interview: assessments stay open; 'finish' ends the session. */
+  interview_done?: boolean;
 }
 
 export interface InterviewPrompt {
@@ -89,15 +126,18 @@ export interface InterviewPrompt {
   difficulty: number;
   is_follow_up: boolean;
   question: string;
+  /** page the question is based on; empty when the coach wrote it */
+  source_name: string;
+  source_url: string;
 }
 
 export interface SessionView {
   thread_id: string;
-  waiting_for: CheckpointPrompt | InterviewPrompt | null;
+  waiting_for: StudyPrompt | CheckpointPrompt | InterviewPrompt | null;
   done: boolean;
   readiness: number;
   state: CoachState;
-  /** skill -> indexes of study topics ticked as done (current cycle) */
+  /** skill -> indexes of study topics ticked as done */
   topic_done: Record<string, number[]>;
 }
 
@@ -112,7 +152,7 @@ export interface ProgressRow {
 
 export interface RespondPayload {
   answers?: number[];
-  action?: 'skip' | 'skip_all' | 'switch';
+  action?: 'assess' | 'retake' | 'interview' | 'finish' | 'skip' | 'skip_all' | 'switch' | 'end';
   skill?: string;
   answer?: string;
   voice_metrics?: Record<string, number>;
@@ -135,7 +175,6 @@ export const coachApi = {
     roleSlug?: string;
     jdText?: string;
     targetRole?: string;
-    interviewTurns: number;
   }) => {
     const form = new FormData();
     form.append('candidate_id', params.candidateId);
@@ -143,7 +182,6 @@ export const coachApi = {
     if (params.roleSlug) form.append('role_slug', params.roleSlug);
     if (params.jdText) form.append('jd_text', params.jdText);
     if (params.targetRole) form.append('target_role', params.targetRole);
-    form.append('interview_turns', String(params.interviewTurns));
     return (await api.post<SessionView>('/start', form)).data;
   },
 

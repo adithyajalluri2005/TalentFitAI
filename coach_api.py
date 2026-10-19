@@ -24,8 +24,10 @@ from src.langgraphagenticai.coach.graph import CoachGraph, make_checkpointer
 from src.langgraphagenticai.coach.nodes import CoachNodes
 from src.langgraphagenticai.coach.roles import RoleStore
 from src.langgraphagenticai.coach.search import SourceSearch
+from src.langgraphagenticai.coach.web_questions import WebQuestions
 from src.langgraphagenticai.coach.state import CoachState
 from src.langgraphagenticai.coach.store import ProgressStore, TopicStore
+
 
 FILLER_WORDS = re.compile(r"\b(um+|uh+|erm|hmm+|like|you know|basically|actually|i mean|sort of|kind of)\b", re.I)
 
@@ -38,8 +40,8 @@ class TopicTick(BaseModel):
 
 class RespondPayload(BaseModel):
     answers: Optional[List[int]] = None         # checkpoint quiz
-    action: Optional[str] = None                # "skip" | "skip_all" | "switch" for checkpoints
-    skill: Optional[str] = None                 # with action "switch": assess this skill next
+    action: Optional[str] = None                # "assess" | "retake" | "interview" | "skip" | "skip_all" | "switch"
+    skill: Optional[str] = None                 # with "assess"/"retake"/"switch": the skill to assess
     answer: Optional[str] = None                # interview answer (typed or transcribed)
     voice_metrics: Optional[Dict[str, float]] = None
 
@@ -63,10 +65,12 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
     store = ProgressStore(db_path)
     topics = TopicStore(db_path)
     roles = RoleStore(db_path)
+    search = SourceSearch()
     nodes = CoachNodes(
         llm,
-        search=SourceSearch(),
+        search=search,
         fallback_llm=fallback_llm,
+        web_questions=WebQuestions(search, db_path) if search else None,
         on_snapshot=lambda state, thread_id, snap: store.record(state.candidate_id, thread_id, state.target_role, snap),
     )
     coach = CoachGraph(nodes, checkpointer=make_checkpointer(db_path))
@@ -115,8 +119,7 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
         role_slug: Optional[str] = Form(None),
         jd_text: Optional[str] = Form(None),
         target_role: str = Form(""),
-        target_readiness: float = Form(75),
-        interview_turns: int = Form(5),
+        target_readiness: float = Form(90),
     ):
         role = roles.get(role_slug) if role_slug else None
         if role_slug and not role:
@@ -131,7 +134,6 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
             jd_text="" if role else jd_text,
             target_role=role.title if role else target_role,
             target_readiness=target_readiness,
-            interview_turns=max(2, min(interview_turns, 10)),
         )
         thread_id = str(uuid.uuid4())
         try:
@@ -143,19 +145,28 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
     async def transcribe(file: UploadFile = File(...)):
         """Whisper transcription plus delivery metrics (pace, filler words),
         which the interview evaluator uses for the communication score."""
-        if not os.getenv("GROQ_API_KEY"):
-            raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
         from groq import Groq
+        from src.langgraphagenticai.LLMS.groqllm import groq_api_keys
+        keys = groq_api_keys()
+        if not keys:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
         content = await file.read()
         if not content:
             raise HTTPException(status_code=422, detail="Empty recording")
-        try:
-            result = Groq().audio.transcriptions.create(
-                file=(file.filename or "answer.webm", content),
-                model="whisper-large-v3-turbo", response_format="verbose_json", language="en",
-            )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Transcription failed: {e}")
+        result, error = None, None
+        for key in keys:  # next key when one is out of quota or rate limited
+            try:
+                result = Groq(api_key=key).audio.transcriptions.create(
+                    file=(file.filename or "answer.webm", content),
+                    model="whisper-large-v3-turbo", response_format="verbose_json", language="en",
+                )
+                break
+            except Exception as e:
+                error = e
+                if not any(s in str(e).lower() for s in ("429", "rate limit", "quota")):
+                    break
+        if result is None:
+            raise HTTPException(status_code=502, detail=f"Transcription failed: {error}")
         text = (result.text or "").strip()
         duration = float(getattr(result, "duration", 0) or 0)
         words = len(text.split())
@@ -177,10 +188,13 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
         current = coach.view(thread_id)
         if current is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        if payload.action == "switch":
+        if payload.action in ("assess", "switch"):
             pending = (current["waiting_for"] or {}).get("pending", [])
             if payload.skill not in pending:
                 raise HTTPException(status_code=422, detail=f"No assessment pending for {payload.skill!r}")
+        if payload.action == "retake":
+            if payload.skill not in (current["waiting_for"] or {}).get("retakeable", []):
+                raise HTTPException(status_code=422, detail=f"No assessment to retake for {payload.skill!r}")
         try:
             return with_topics(coach.respond(thread_id, payload.model_dump(exclude_none=True)))
         except ValueError as e:

@@ -17,6 +17,7 @@ import {
   Video,
   Star,
   AlertCircle,
+  RotateCcw,
   Sparkles,
 } from 'lucide-react';
 import { Resource, SessionView } from '@/services/coach';
@@ -76,24 +77,32 @@ function Stat({ icon: Icon, value, label, tone }: {
   );
 }
 
-export default function SkillGapView({ view, onTick, onAssess, onInterview }: {
+export default function SkillGapView({ view, onTick, onAssess, onRetake, onInterview, interviewDone = false, onViewResults, onFinish }: {
   view: SessionView;
   /** tick / untick a study topic */
   onTick?: (skill: string, topicIndex: number, done: boolean) => void;
   /** open (or switch to) this skill's assessment */
   onAssess?: (skill: string) => void;
+  /** take an already-assessed skill's assessment again */
+  onRetake?: (skill: string) => void;
   onInterview?: () => void;
+  /** the session's interview already happened */
+  interviewDone?: boolean;
+  onViewResults?: () => void;
+  onFinish?: () => void;
 }) {
   const { state, waiting_for: waiting } = view;
   const matchedSkills = state.skills.filter((s) => s.level >= s.required_level);
   const missingSkills = state.skills.filter((s) => s.level < s.required_level);
   const plan = state.plan;
   const topicDone = view.topic_done ?? {};
-  // Skills still awaiting their assessment this cycle, and results for the ones taken.
-  const pending = waiting?.type === 'checkpoint' ? waiting.pending ?? [waiting.skill] : [];
-  const assessed = new Map(
-    state.checkpoints.filter((c) => c.cycle === state.cycle).map((c) => [c.skill, c] as const),
-  );
+  // Skills still awaiting their assessment, and the latest result for the ones taken.
+  const pending = waiting?.type === 'study' ? waiting.pending
+    : waiting?.type === 'checkpoint' ? waiting.pending ?? [waiting.skill] : [];
+  const retakeable = new Set(waiting?.type === 'study' ? waiting.retakeable ?? [] : []);
+  const assessed = new Map(state.checkpoints.map((c) => [c.skill, c] as const));
+  const interviewOpen = !interviewDone
+    && (waiting?.type === 'interview_question' || (waiting?.type === 'study' && pending.length === 0));
 
   return (
     <div className="space-y-6">
@@ -229,8 +238,15 @@ export default function SkillGapView({ view, onTick, onAssess, onInterview }: {
                               )}
                             </div>
                           )}
-                          {result?.skipped && (
-                            <p className="text-xs text-muted-foreground text-center">Assessment skipped</p>
+                          {result && (
+                            <div className="pt-1 px-2 space-y-2">
+                              {result.skipped && <p className="text-xs text-muted-foreground text-center">Assessment skipped</p>}
+                              {retakeable.has(p.skill) && onRetake && (
+                                <Button variant="outline" className="w-full" onClick={() => onRetake(p.skill)}>
+                                  <RotateCcw className="h-4 w-4 mr-2" /> {result.skipped ? `Take ${p.skill} assessment` : 'Retake assessment'}
+                                </Button>
+                              )}
+                            </div>
                           )}
                         </CardContent>
                       </Card>
@@ -244,7 +260,19 @@ export default function SkillGapView({ view, onTick, onAssess, onInterview }: {
           {/* Final interview gate */}
           {!view.done && (
             <div className="pt-4 mt-6 border-t">
-              {waiting?.type === 'interview_question' ? (
+              {interviewDone ? (
+                <div className="flex flex-wrap items-center gap-3 rounded-lg border border-success/40 bg-success/5 p-4">
+                  <CheckCircle2 className="h-5 w-5 shrink-0 text-success" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium">Final interview completed</p>
+                    <p className="text-xs text-muted-foreground">Retake any assessment above to raise your readiness, then end the session.</p>
+                  </div>
+                  <div className="flex gap-2">
+                    {onViewResults && <Button size="sm" variant="outline" onClick={onViewResults}>View results</Button>}
+                    {onFinish && <Button size="sm" onClick={onFinish}>End session</Button>}
+                  </div>
+                </div>
+              ) : interviewOpen ? (
                 <Button onClick={onInterview} className="w-full" disabled={!onInterview}>
                   <Video className="h-4 w-4 mr-2" /> Start final interview (camera + mic)
                 </Button>

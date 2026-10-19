@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from coach_api import build_coach_router
-from src.langgraphagenticai.LLMS.groqllm import GroqLLM
+from src.langgraphagenticai.LLMS.groqllm import GroqLLM, groq_api_keys
 
 load_dotenv()
 
@@ -61,10 +61,14 @@ GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 # Monotonic so /health uptime is immune to wall-clock jumps.
 PROCESS_START = time.monotonic()
 
-app.include_router(build_coach_router(
-    GroqLLM(model_name=GROQ_MODEL).llm, DB_FILE_PATH,
-    fallback_llm=GroqLLM(model_name=GROQ_FALLBACK_MODEL).llm if GROQ_FALLBACK_MODEL else None,
-))
+# Every Groq key (GROQ_API_KEY, GROQ_API_KEY_1, ...) has its own quota. Calls go
+# to the main model on each key in turn, then the fallback model on each key.
+GROQ_KEYS = groq_api_keys()
+_models = [GroqLLM(GROQ_MODEL, key).llm for key in GROQ_KEYS] or [GroqLLM(GROQ_MODEL).llm]
+if GROQ_FALLBACK_MODEL:
+    _models += [GroqLLM(GROQ_FALLBACK_MODEL, key).llm for key in GROQ_KEYS]
+
+app.include_router(build_coach_router(_models[0], DB_FILE_PATH, fallback_llm=_models[1:]))
 
 
 @app.get("/")
@@ -98,9 +102,11 @@ async def health():
             "database": "ok" if not db_error else "error",
             "llm_model": GROQ_MODEL,
             "llm_fallback_model": GROQ_FALLBACK_MODEL,
-            "groq_key": "set" if os.getenv("GROQ_API_KEY") else "missing",
+            "groq_key": "set" if GROQ_KEYS else "missing",
+            "groq_keys": len(GROQ_KEYS),
             # Free providers first; keyed ones are backups (see coach/search.py).
-            "search_web": ["ddgs"] + (["tavily"] if os.getenv("TAVILY_API_KEY") else []),
+            "search_web": (["langsearch"] if os.getenv("LANGSEARCH_API_KEY") else [])
+                          + (["tavily"] if os.getenv("TAVILY_API_KEY") else []),
             "search_videos": ["yt-dlp"],
         },
     }

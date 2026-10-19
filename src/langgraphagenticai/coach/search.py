@@ -1,8 +1,11 @@
-"""Source search for study plans, free providers first.
+"""Source search for study plans and interview questions.
 
-- Web pages: `ddgs` (metasearch, no API key), falling back to Tavily when
-  TAVILY_API_KEY is set. Free metasearch is often blocked from cloud servers;
-  the fallback covers that.
+- Web pages: LangSearch (LANGSEARCH_API_KEY, free tier 1,000 queries/day),
+  then Tavily (TAVILY_API_KEY) when LangSearch fails or finds nothing. Free
+  metasearch (ddgs) was removed: search engines block it from servers, so it
+  mostly cost seconds before falling through to these anyway.
+- Pages with their text (``pages``): LangSearch, then Tavily. Used for
+  interview questions, so the coach never has to fetch the sites itself.
 - YouTube videos: yt-dlp search (no key).
 - GitHub repositories: GitHub's REST search API (no key needed; set
   GITHUB_TOKEN to raise the rate limit from 10 to 30 searches/minute).
@@ -20,7 +23,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,32 @@ def clean_title(title: str, url: str = "") -> str:
     return t
 
 
+# Regional mirrors of official docs -> the official site.
+_MIRRORS = {"developers.google.cn": "developers.google.com", "tensorflow.google.cn": "www.tensorflow.org",
+            "cloud.google.cn": "cloud.google.com", "pytorch.apachecn.org": "pytorch.org"}
+# Pinned old doc versions -> the current ("stable") docs of the same page.
+_VERSIONED_DOCS = (
+    (re.compile(r"^(https?://docs\.python\.org)/(?:release/)?[23](?:\.\d+)+/"), r"\1/3/"),
+    (re.compile(r"^(https?://pandas\.pydata\.org)/pandas-docs/(?:version/[\d.]+|stable)/"), r"\1/docs/"),
+    (re.compile(r"^(https?://numpy\.org/doc)/\d+(?:\.\d+)+/"), r"\1/stable/"),
+    (re.compile(r"^(https?://scikit-learn\.org)/\d+(?:\.\d+)+/"), r"\1/stable/"),
+    (re.compile(r"^(https?://docs\.djangoproject\.com/en)/\d+(?:\.\d+)+/"), r"\1/stable/"),
+    (re.compile(r"^(https?://matplotlib\.org)/\d+(?:\.\d+)+/"), r"\1/stable/"),
+)
+
+
+def canonical_url(url: str) -> str:
+    """Official, current docs instead of a regional mirror or a pinned old
+    version (e.g. developers.google.cn, docs.python.org/release/3.9.16/)."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.netloc.lower()
+    if host in _MIRRORS:
+        url = urllib.parse.urlunsplit(parts._replace(netloc=_MIRRORS[host]))
+    for pattern, repl in _VERSIONED_DOCS:
+        url = pattern.sub(repl, url)
+    return url
+
+
 def _domain(url: str) -> str:
     return urllib.parse.urlparse(url).netloc.lower().removeprefix("www.")
 
@@ -159,47 +188,63 @@ def _http_json(url: str, headers: dict, body: Optional[dict] = None, timeout: in
 
 
 class SourceSearch:
-    """Web + video search, free providers first:
+    """Web + video search:
 
-        web:    ddgs (free, no key) -> Tavily API
+        web:    LangSearch API -> Tavily API
+        pages:  LangSearch API -> Tavily API (results with page text)
         videos: yt-dlp (free, no key)
 
-    Tavily is used only when TAVILY_API_KEY is set and ddgs fails or returns
-    nothing, which keeps its monthly free quota for when it's needed.
+    Each API is used only when its key is set; Tavily only when LangSearch
+    fails or returns nothing, which keeps its free quota for when it's needed.
     """
 
-    def __init__(self, github_token: Optional[str] = None, tavily_key: Optional[str] = None):
-        from ddgs import DDGS
-        self._ddgs = DDGS(timeout=15)
+    def __init__(self, github_token: Optional[str] = None, tavily_key: Optional[str] = None,
+                 langsearch_key: Optional[str] = None):
         self._github_token = github_token if github_token is not None else os.getenv("GITHUB_TOKEN", "")
         self._tavily_key = (tavily_key if tavily_key is not None else os.getenv("TAVILY_API_KEY", "")).strip()
-        self._ddgs_breaker = _Breaker()
+        self._langsearch_key = (langsearch_key if langsearch_key is not None
+                                else os.getenv("LANGSEARCH_API_KEY", "")).strip()
+        self._langsearch_breaker = _Breaker()
         self._ytdlp_breaker = _Breaker()
 
     @property
     def providers(self) -> dict:
-        return {"web": ["ddgs"] + (["tavily"] if self._tavily_key else []),
+        keyed = (["langsearch"] if self._langsearch_key else []) + (["tavily"] if self._tavily_key else [])
+        return {"web": keyed, "pages": keyed,
                 "videos": ["yt-dlp"],
                 "github": ["github-api" + (" (token)" if self._github_token else "")]}
 
     # ---------------- raw web providers: -> [{title, url, body}] ---------------- #
 
-    def _web_ddgs(self, q: str, site: str, n: int) -> List[dict]:
-        if not self._ddgs_breaker.available():
+    def _langsearch(self, q: str, domains: List[str], n: int, text_chars: int = 0) -> List[dict]:
+        """Raw LangSearch call -> [{title, url, body}]; body is the page text
+        when ``text_chars`` is set, else the snippet."""
+        if not self._langsearch_key or not self._langsearch_breaker.available():
             return []
-        query = f"{q} site:{site}" if site else q
-        for wait in (0, 2):  # metasearch engines rate-limit bursts; one short pause usually clears it
-            if wait:
-                time.sleep(wait)
-            try:
-                hits = list(self._ddgs.text(query, max_results=n) or [])
-                self._ddgs_breaker.record(True, "ddgs")
-                return [{"title": r.get("title", ""), "url": r.get("href", ""), "body": r.get("body", "")} for r in hits]
-            except Exception as e:
-                last = e
-        self._ddgs_breaker.record(False, "ddgs")
-        logger.info("ddgs failed for %r: %s", query, last)
-        return []
+        body = {"query": q, "count": max(1, min(n, 50))}
+        # An include list already rules out blocked sites; sending both can return nothing.
+        if domains:
+            body["includeDomains"] = domains
+        else:
+            body["excludeDomains"] = list(BLOCKED_DOMAINS)
+        if text_chars:
+            body["contents"] = {"text": {"maxCharacters": text_chars}}
+        try:
+            data = _http_json("https://api.langsearch.com/v1/web-search",
+                              {"Authorization": f"Bearer {self._langsearch_key}"}, body, timeout=25)
+            if data.get("code") not in (None, 200):
+                raise RuntimeError(f"code {data.get('code')}: {data.get('msg')}")
+        except Exception as e:
+            self._langsearch_breaker.record(False, "langsearch")
+            logger.warning("langsearch failed for %r: %s", q, e)
+            return []
+        self._langsearch_breaker.record(True, "langsearch")
+        hits = ((data.get("data") or {}).get("webPages") or {}).get("value") or []
+        return [{"title": r.get("name", ""), "url": r.get("url", ""),
+                 "body": (r.get("text") if text_chars else r.get("snippet")) or ""} for r in hits]
+
+    def _web_langsearch(self, q: str, site: str, n: int) -> List[dict]:
+        return self._langsearch(q, [site] if site else [], n)
 
     def _web_tavily(self, q: str, site: str, n: int) -> List[dict]:
         if not self._tavily_key:
@@ -218,10 +263,10 @@ class SourceSearch:
 
     def web(self, query: str, site: str = "", n: int = 6) -> List[dict]:
         out = []
-        for name, provider in (("ddgs", self._web_ddgs), ("tavily", self._web_tavily)):
+        for name, provider in (("langsearch", self._web_langsearch), ("tavily", self._web_tavily)):
             raw = provider(query, site, n)
             for r in raw:
-                url, title = r.get("url") or "", (r.get("title") or "").strip()
+                url, title = canonical_url(r.get("url") or ""), (r.get("title") or "").strip()
                 if not url or _blocked(url, title) or (site and site not in _domain(url)):
                     continue
                 if "youtube.com" in url or "youtu.be" in url:
@@ -230,10 +275,47 @@ class SourceSearch:
                             "source": _domain(url), "meta": "",
                             "snippet": " ".join((r.get("body") or "").split())[:200]})
             if out:
-                if name != "ddgs":
+                if name != "langsearch":
                     logger.info("web search for %r served by %s", query, name)
                 break
         return out
+
+    def _pages_tavily(self, q: str, domains: List[str], n: int, text_chars: int) -> List[dict]:
+        if not self._tavily_key:
+            return []
+        body = {"query": q, "max_results": min(n, 10), "search_depth": "basic", "include_raw_content": "text"}
+        # Tavily returns no results when include_domains and exclude_domains are both set.
+        if domains:
+            body["include_domains"] = domains
+        else:
+            body["exclude_domains"] = list(BLOCKED_DOMAINS)
+        try:
+            data = _http_json("https://api.tavily.com/search", {"Authorization": f"Bearer {self._tavily_key}"}, body,
+                              timeout=30)
+        except Exception as e:
+            logger.warning("tavily page search failed for %r: %s", q, e)
+            return []
+        return [{"title": r.get("title", ""), "url": r.get("url", ""), "body": (r.get("raw_content") or "")[:text_chars]}
+                for r in data.get("results", [])]
+
+    def pages(self, query: str, domains: List[str], n: int = 3, text_chars: int = 9000,
+              keep: Optional[Callable[[List[dict]], List[dict]]] = None) -> List[dict]:
+        """Search results with each page's text: [{title, url, text}].
+        LangSearch first, Tavily as backup; [] when neither key is set or
+        both fail (callers then search and fetch pages themselves). ``keep``
+        filters a provider's results; if it leaves nothing, the next
+        provider is tried."""
+        for name, provider in (("langsearch", lambda: self._langsearch(query, domains, n, text_chars)),
+                               ("tavily", lambda: self._pages_tavily(query, domains, n, text_chars))):
+            out = [{"title": clean_title(r["title"], r["url"]), "url": r["url"], "text": r["body"]}
+                   for r in provider() if r.get("url") and r.get("body") and not _blocked(r["url"])]
+            if keep:
+                out = keep(out)
+            if out:
+                if name != "langsearch":
+                    logger.info("page search for %r served by %s", query, name)
+                return out
+        return []
 
     # ---------------- videos ---------------- #
 

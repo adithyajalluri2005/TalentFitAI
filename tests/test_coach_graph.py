@@ -1,4 +1,4 @@
-"""Drives the whole coaching loop through every interrupt with a scripted LLM."""
+"""Drives a whole coaching session through every interrupt with a scripted LLM."""
 from src.langgraphagenticai.coach import nodes as N
 from src.langgraphagenticai.coach import scoring
 from src.langgraphagenticai.coach.graph import CoachGraph
@@ -61,7 +61,7 @@ class FakeLLM:
                 ])
             return N._Curation(topics=[N._Pick(key="t1.0", picks=[])])
         if schema is N._Quiz:
-            return N._Quiz(questions=[QuizQuestion(question=f"q{i}", options=["a", "b", "c", "d"], answer_index=0) for i in range(4)])
+            return N._Quiz(questions=[N._QuizItem(question=f"q{i}", options=["a", "b", "c", "d"], answer_index=0) for i in range(4)])
         if schema is N._Question:
             return N._Question(question=f"question {prompt.count('FOLLOW-UP')}")
         if schema is N._Evaluation:
@@ -80,59 +80,150 @@ def _state(**kw):
     return CoachState(candidate_id="c1", resume_text="resume", jd_text="jd", interview_turns=3, **kw)
 
 
-def test_full_loop_reaches_ready_and_records_history():
+def test_session_is_single_pass_with_retakes_and_records_history():
     snapshots = []
-    coach = CoachGraph(CoachNodes(FakeLLM(), on_snapshot=lambda s, t, snap: snapshots.append((t, snap))))
-
+    llm = FakeLLM()
+    coach = CoachGraph(CoachNodes(llm, on_snapshot=lambda s, t, snap: snapshots.append((t, snap))))
     view = coach.start("t1", _state(target_readiness=85))
-    # Diagnosis done, two gap skills -> first checkpoint, answers hidden from client.
-    assert view["waiting_for"]["type"] == "checkpoint"
-    assert view["waiting_for"]["skill"] == "Docker"  # highest weight x gap
-    assert "answer_index" not in str(view["waiting_for"])
-    assert "current_quiz" not in view["state"]
+    # Diagnosis + plan only: no quiz is written until the candidate asks for one.
+    assert view["waiting_for"] == {"type": "study", "pending": ["Docker", "SQL"], "retakeable": [], "interview_done": False,   # highest weight x gap first
+                                   "accepts": {"action": "'assess' | 'retake' (with skill) | 'interview' | 'skip_all'"}}
+    assert "_Quiz" not in llm.calls
     start_readiness = view["readiness"]
 
-    view = coach.respond("t1", {"answers": [0, 0, 0, 0]})       # Docker: perfect
-    assert view["waiting_for"]["skill"] == "SQL"
-    assert view["readiness"] > start_readiness                 # live score moves on checkpoint
+    view = coach.respond("t1", {"action": "assess", "skill": "Docker"})
+    assert view["waiting_for"]["type"] == "checkpoint" and view["waiting_for"]["skill"] == "Docker"
+    assert "answer_index" not in str(view["waiting_for"])      # answers hidden from client
+    assert view["waiting_for"]["questions"][0]["source_url"] == ""   # model-written: no source
+    assert "current_quiz" not in view["state"]
+
+    view = coach.respond("t1", {"answers": [1, 1, 0, 0]})       # Docker: half right
+    assert view["waiting_for"]["type"] == "study" and view["waiting_for"]["pending"] == ["SQL"]
+    assert view["waiting_for"]["retakeable"] == ["Docker"]
+    half = view["readiness"]
+    assert half > start_readiness                              # live score moves on checkpoint
+
+    # Retake Docker: the new score replaces the old one.
+    view = coach.respond("t1", {"action": "retake", "skill": "Docker"})
+    assert view["waiting_for"]["type"] == "checkpoint" and view["waiting_for"]["skill"] == "Docker"
+    view = coach.respond("t1", {"answers": [0, 0, 0, 0]})
+    assert view["readiness"] > half
+    docker = next(s for s in view["state"]["skills"] if s["skill"] == "Docker")
+    assert [o["source"] for o in docker["observations"]] == ["resume", "checkpoint"]
+    assert [c["score"] for c in view["state"]["checkpoints"]] == [0.5, 1.0]
+
+    view = coach.respond("t1", {"action": "interview"})        # SQL still pending: ignored
+    assert view["waiting_for"]["type"] == "study"
+    view = coach.respond("t1", {"action": "assess", "skill": "SQL"})
     view = coach.respond("t1", {"action": "skip"})              # SQL: skipped
+    # Every assessment done: stays on the plan until the interview is started.
+    assert view["waiting_for"]["type"] == "study" and view["waiting_for"]["pending"] == []
+    assert view["waiting_for"]["retakeable"] == ["Docker", "SQL"]
+    view = coach.respond("t1", {"action": "interview"})
     assert view["waiting_for"]["type"] == "interview_question"
 
-    # Cycle 0: weak answers -> follow-up, ends below target, so loop re-plans.
     view = coach.respond("t1", {"answer": "meh"})
     assert view["waiting_for"]["is_follow_up"] is True
-    view = coach.respond("t1", {"answer": "meh"})
-    view = coach.respond("t1", {"answer": "meh"})
-    assert view["state"]["cycle"] == 1
-    assert view["state"]["status"] == "learning"
-    assert len(view["state"]["history"]) == 1
-    assert view["waiting_for"]["type"] == "checkpoint"          # new cycle, new plan
+    assert view["waiting_for"]["turn"] == 1                     # a follow-up keeps its question's number
+    view = coach.respond("t1", {"answer": "meh"})               # no follow-up on a follow-up
+    assert view["waiting_for"]["turn"] == 2 and not view["waiting_for"]["is_follow_up"]
+    view = coach.respond("t1", {"answer": "good answer"})
+    assert view["waiting_for"]["turn"] == 3
+    view = coach.respond("t1", {"answer": "good answer"})
 
-    view = coach.respond("t1", {"action": "skip_all"})
-    for _ in range(3):
-        view = coach.respond("t1", {"answer": "good answer"})
+    # 3 main questions plus 1 follow-up: summarized, no re-plan, back on the plan.
+    assert view["done"] is False
+    assert view["state"]["status"] in ("ready", "finished") and view["state"]["cycle"] == 0
+    assert len(view["state"]["history"]) == 1 and view["state"]["summary"]
+    w = view["waiting_for"]
+    assert w["type"] == "study" and w["interview_done"] is True and w["retakeable"] == ["Docker", "SQL"]
 
-    assert view["done"] is True
-    assert view["state"]["status"] == "ready"
+    # Assessments after the interview: the skipped SQL one now counts and re-scores readiness.
+    view = coach.respond("t1", {"action": "interview"})          # one interview per session: ignored
+    assert view["waiting_for"]["type"] == "study"
+    view = coach.respond("t1", {"action": "retake", "skill": "SQL"})
+    assert view["waiting_for"]["type"] == "checkpoint" and view["waiting_for"]["interview_done"] is True
+    view = coach.respond("t1", {"action": "skip_all"})           # no interview to skip to: just a skip
+    assert view["waiting_for"]["type"] == "study"
+    assert [c["skipped"] for c in view["state"]["checkpoints"] if c["skill"] == "SQL"] == [True]
+    before = view["state"]["history"][-1]["readiness"]
+    view = coach.respond("t1", {"action": "retake", "skill": "SQL"})
+    view = coach.respond("t1", {"answers": [0, 0, 0, 0]})
     h = view["state"]["history"]
-    assert len(h) == 2 and h[1]["readiness"] > h[0]["readiness"]
+    assert len(h) == 2 and h[-1]["readiness"] > before
+    assert view["waiting_for"]["type"] == "study"
+
+    view = coach.respond("t1", {"action": "finish"})
+    assert view["done"] is True
     assert [t for t, _ in snapshots] == ["t1", "t1"]
 
 
 def test_respond_when_not_waiting_raises():
     coach = CoachGraph(CoachNodes(FakeLLM()))
-    st = _state(max_cycles=1)
-    coach.start("t2", st)
+    coach.start("t2", _state())
     coach.respond("t2", {"action": "skip_all"})
-    for _ in range(3):
+    for _ in range(6):                                          # 3 weak answers, each followed up
         view = coach.respond("t2", {"answer": "meh"})
-    assert view["done"] and view["state"]["status"] == "finished"
+    assert len(view["state"]["interview"]) == 6
+    assert view["state"]["status"] == "finished"
+    view = coach.respond("t2", {"action": "finish"})
+    assert view["done"]
     try:
         coach.respond("t2", {"answer": "x"})
     except ValueError:
         pass
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_skip_interview_question():
+    coach = CoachGraph(CoachNodes(FakeLLM()))
+    coach.start("t8", _state())
+    view = coach.respond("t8", {"action": "skip_all"})
+    assert view["waiting_for"]["type"] == "interview_question"
+    view = coach.respond("t8", {"action": "skip"})
+    # Skipped: no follow-up, straight on to question 2, scored as unanswered.
+    assert view["waiting_for"]["turn"] == 2 and not view["waiting_for"]["is_follow_up"]
+    skipped = view["state"]["interview"][0]
+    assert skipped["answer"] == "SKIPPED" and skipped["feedback"] == "Question skipped."
+    assert skipped["score"] == {"correctness": 1, "depth": 1, "communication": 1}
+
+
+    # A skip is no evidence of skill: it must not lift a skill above its resume level.
+    view = coach.respond("t8", {"action": "end"})
+    sk = next(s for s in view["state"]["skills"] if s["skill"] == skipped["skill"])
+    obs = [o for o in sk["observations"] if o["source"] == "interview"]
+    assert obs and all(o["value"] == 0.0 for o in obs) and sk["level"] <= sk["baseline"]
+
+
+def test_end_interview_early():
+    coach = CoachGraph(CoachNodes(FakeLLM()))
+    coach.start("t9", _state())
+    coach.respond("t9", {"action": "skip_all"})
+    view = coach.respond("t9", {"answer": "good answer"})
+    assert view["waiting_for"]["turn"] == 2
+    view = coach.respond("t9", {"action": "end"})
+    # Wrapped up: only the answered question counts, the unanswered one is dropped.
+    assert view["state"]["status"] in ("ready", "finished")
+    assert [t["answer"] for t in view["state"]["interview"]] == ["good answer"]
+    assert len(view["state"]["history"]) == 1 and view["state"]["summary"]
+
+
+def test_end_interview_before_any_answer():
+    coach = CoachGraph(CoachNodes(FakeLLM()))
+    coach.start("t10", _state())
+    coach.respond("t10", {"action": "skip_all"})
+    view = coach.respond("t10", {"action": "end"})
+    assert view["state"]["interview"] == [] and view["state"]["status"] in ("ready", "finished")
+    assert len(view["state"]["history"]) == 1
+
+
+def test_quiz_text_literal_newlines_are_unescaped():
+    from src.langgraphagenticai.coach.nodes import _unescape
+    raw = "Given:\\n\\ndef f(x):\\n    return x"
+    assert _unescape(raw) == "Given:\n\ndef f(x):\n    return x"
+    assert _unescape("plain question") == "plain question"
+    assert _unescape("sort 10\\,000\\,000 integers") == "sort 10,000,000 integers"
 
 
 def test_scoring_is_deterministic_and_capped():
@@ -207,12 +298,14 @@ def test_plan_sources_curated_only_from_search_results():
 
     assert ("topic", "Docker images tutorial", "docs.docker.com") in search.calls
     assert ("skill", "Docker", "", "") in search.calls
+    view = coach.respond("t4", {"action": "assess", "skill": "Docker"})
     assert view["waiting_for"]["topics"][0]["title"] == "Images"
 
 
 def test_refresh_plan_keeps_pending_step():
     coach = CoachGraph(CoachNodes(FakeLLM()))
-    before = coach.start("t5", _state(target_readiness=85))
+    coach.start("t5", _state(target_readiness=85))
+    before = coach.respond("t5", {"action": "assess", "skill": "Docker"})
     cfg = coach._cfg("t5")
     # Simulate a session saved in the old weekly format: skills, no topics.
     coach.graph.update_state(cfg, {"plan": [{"skill": "Docker"}, {"skill": "SQL"}]})
@@ -222,7 +315,7 @@ def test_refresh_plan_keeps_pending_step():
     assert [len(p["topics"]) for p in after["state"]["plan"]] == [2, 1]
     assert after["waiting_for"] == before["waiting_for"]       # same quiz still pending
     view = coach.respond("t5", {"answers": [0, 0, 0, 0]})       # and it still resumes
-    assert view["waiting_for"]["skill"] == "SQL"
+    assert view["waiting_for"]["pending"] == ["SQL"]
 
 
 def test_clean_title_fixes_search_engine_junk():
@@ -261,7 +354,8 @@ def test_fallback_never_shows_untrusted_links():
 
 def test_switch_assessment_order_then_resume_queue():
     coach = CoachGraph(CoachNodes(FakeLLM()))
-    view = coach.start("t7", _state(target_readiness=85))
+    coach.start("t7", _state(target_readiness=85))
+    view = coach.respond("t7", {"action": "assess", "skill": "Docker"})
     assert view["waiting_for"]["skill"] == "Docker" and view["waiting_for"]["pending"] == ["Docker", "SQL"]
 
     view = coach.respond("t7", {"action": "switch", "skill": "SQL"})   # SQL's topics were finished first
@@ -269,10 +363,12 @@ def test_switch_assessment_order_then_resume_queue():
     assert view["state"]["switch_to"] is None
 
     view = coach.respond("t7", {"answers": [0, 0, 0, 0]})              # pass SQL
-    assert view["waiting_for"]["skill"] == "Docker"                    # back to the remaining skill
+    assert view["waiting_for"]["pending"] == ["Docker"]                # back to studying the rest
     assert [c["skill"] for c in view["state"]["checkpoints"]] == ["SQL"]
 
-    view = coach.respond("t7", {"action": "switch", "skill": "Nope"})  # unknown skill: ignored, treated as no answers
+    view = coach.respond("t7", {"action": "assess", "skill": "Nope"})  # unknown skill: ignored, still studying
+    assert view["waiting_for"]["type"] == "study"
+    view = coach.respond("t7", {"action": "skip_all"})
     assert view["waiting_for"]["type"] == "interview_question"
 
 
@@ -298,9 +394,7 @@ def test_topic_tick_endpoint(tmp_path):
     app = FastAPI()
     app.include_router(coach_api.build_coach_router(FakeLLM(), str(tmp_path / "c.db")))
     client = TestClient(app)
-    router_coach = [r for r in app.routes if getattr(r, "path", "") == "/coach/{thread_id}/topics"]
-    assert router_coach
-    # build a session directly through the graph the router uses
+    # (Newer FastAPI no longer lists included routes in app.routes; the calls below exercise the endpoint.)
     view = client.post("/coach/start", data={"candidate_id": "c", "jd_text": "x" * 60},
                        files={"resume": ("r.pdf", _tiny_pdf(), "application/pdf")}).json()
     tid = view["thread_id"]
@@ -337,9 +431,10 @@ def test_switch_endpoint_rejects_unknown_skill(tmp_path):
     client = TestClient(app)
     tid = client.post("/coach/start", data={"candidate_id": "c", "jd_text": "x" * 60},
                       files={"resume": ("r.pdf", _tiny_pdf(), "application/pdf")}).json()["thread_id"]
+    assert client.post(f"/coach/{tid}/respond", json={"action": "assess", "skill": "Nope"}).status_code == 422
+    assert client.get(f"/coach/{tid}").json()["waiting_for"]["type"] == "study"         # untouched
+    assert client.post(f"/coach/{tid}/respond", json={"action": "assess", "skill": "SQL"}).json()["waiting_for"]["skill"] == "SQL"
     assert client.post(f"/coach/{tid}/respond", json={"action": "switch", "skill": "Nope"}).status_code == 422
-    assert client.get(f"/coach/{tid}").json()["waiting_for"]["skill"] == "Docker"     # untouched
-    assert client.post(f"/coach/{tid}/respond", json={"action": "switch", "skill": "SQL"}).json()["waiting_for"]["skill"] == "SQL"
 
 
 def test_daily_quota_switches_to_fallback_model_without_waiting():
@@ -366,41 +461,196 @@ def test_daily_quota_switches_to_fallback_model_without_waiting():
     assert _time.time() - t < 1          # no backoff sleeps for a daily limit
 
 
-def _search_with(tavily=""):
+def _search_with(tavily="", langsearch=""):
     from src.langgraphagenticai.coach.search import SourceSearch
-    return SourceSearch(github_token="", tavily_key=tavily)
+    return SourceSearch(github_token="", tavily_key=tavily, langsearch_key=langsearch)
 
 
-def test_web_search_falls_back_to_tavily(monkeypatch):
-    s = _search_with(tavily="t")
-    calls = []
-    hit = lambda name: [{"title": f"{name} doc", "url": f"https://docs.python.org/{name}", "body": "x"}]
-    monkeypatch.setattr(s, "_web_ddgs", lambda q, site, n: calls.append("ddgs") or [])
-    monkeypatch.setattr(s, "_web_tavily", lambda q, site, n: calls.append("tavily") or hit("tavily"))
-    assert s.web("python typing")[0]["url"].endswith("/tavily") and calls == ["ddgs", "tavily"]
-
-    calls.clear()
-    monkeypatch.setattr(s, "_web_ddgs", lambda q, site, n: calls.append("ddgs") or hit("ddgs"))
-    assert s.web("python typing")[0]["url"].endswith("/ddgs") and calls == ["ddgs"]   # tavily quota untouched
-
-
-def test_tavily_skipped_without_key():
+def test_keyed_providers_skipped_without_keys():
     s = _search_with()
-    assert s._web_tavily("q", "", 5) == []
-    assert s.providers["web"] == ["ddgs"] and _search_with(tavily="t").providers["web"] == ["ddgs", "tavily"]
+    assert s._web_tavily("q", "", 5) == [] and s._web_langsearch("q", "", 5) == [] and s.web("q") == []
+    assert s.providers["web"] == [] and _search_with(tavily="t").providers["web"] == ["tavily"]
 
 
-def test_ddgs_circuit_breaker_stops_retrying_a_blocked_provider(monkeypatch):
+def test_langsearch_circuit_breaker_stops_retrying_a_failing_provider(monkeypatch):
     import src.langgraphagenticai.coach.search as search_mod
-    monkeypatch.setattr(search_mod.time, "sleep", lambda s: None)
-    s = _search_with(tavily="t")
+    s = _search_with(langsearch="l")
     attempts = []
 
-    def blocked(*a, **k):
+    def failing(*a, **k):
         attempts.append(1)
-        raise RuntimeError("h2 connection driver error: connection reset")
-    monkeypatch.setattr(s._ddgs, "text", blocked)
+        raise RuntimeError("connection reset")
+    monkeypatch.setattr(search_mod, "_http_json", failing)
     for _ in range(3):
-        s._web_ddgs("q", "", 5)
+        s._web_langsearch("q", "", 5)
     before = len(attempts)
-    assert s._web_ddgs("q", "", 5) == [] and len(attempts) == before   # breaker open: no more attempts
+    assert s._web_langsearch("q", "", 5) == [] and len(attempts) == before   # breaker open: no more attempts
+
+
+def test_web_search_order_langsearch_then_tavily(monkeypatch):
+    s = _search_with(tavily="t", langsearch="l")
+    calls = []
+    hit = lambda name: [{"title": f"{name} doc", "url": f"https://docs.python.org/{name}", "body": "x"}]
+    monkeypatch.setattr(s, "_web_langsearch", lambda q, site, n: calls.append("langsearch") or hit("langsearch"))
+    monkeypatch.setattr(s, "_web_tavily", lambda q, site, n: calls.append("tavily") or hit("tavily"))
+    assert s.web("python typing")[0]["url"].endswith("/langsearch") and calls == ["langsearch"]   # tavily quota untouched
+
+    calls.clear()
+    monkeypatch.setattr(s, "_web_langsearch", lambda q, site, n: calls.append("langsearch") or [])
+    assert s.web("python typing")[0]["url"].endswith("/tavily") and calls == ["langsearch", "tavily"]
+    assert s.providers["web"] == ["langsearch", "tavily"] and s.providers["pages"] == ["langsearch", "tavily"]
+
+
+def test_langsearch_request_and_response(monkeypatch):
+    import src.langgraphagenticai.coach.search as search_mod
+    sent = {}
+
+    def fake_http(url, headers, body=None, timeout=15):
+        sent.update(url=url, auth=headers["Authorization"], body=body)
+        return {"code": 200, "data": {"webPages": {"value": [
+            {"name": "SQL Interview Questions - GeeksforGeeks", "url": "https://www.geeksforgeeks.org/sql-iq/",
+             "snippet": "short", "text": "full page text " * 50}]}}}
+    monkeypatch.setattr(search_mod, "_http_json", fake_http)
+    s = _search_with(langsearch="key123")
+
+    pages = s.pages("SQL interview questions", ["geeksforgeeks.org"], n=3, text_chars=9000)
+    assert sent["url"] == "https://api.langsearch.com/v1/web-search" and sent["auth"] == "Bearer key123"
+    assert sent["body"]["includeDomains"] == ["geeksforgeeks.org"]
+    assert sent["body"]["contents"] == {"text": {"maxCharacters": 9000}}
+    assert pages[0]["title"] == "SQL Interview Questions" and pages[0]["text"].startswith("full page text")
+
+    assert s._web_langsearch("q", "geeksforgeeks.org", 5)[0]["body"] == "short"   # snippet when no text asked
+    assert "contents" not in sent["body"]
+
+    monkeypatch.setattr(search_mod, "_http_json", lambda *a, **k: {"code": 401, "msg": "bad key"})
+    assert s._web_langsearch("q", "", 5) == []                                   # API error -> next provider
+
+
+def test_pages_fall_back_to_tavily(monkeypatch):
+    s = _search_with(tavily="t", langsearch="l")
+    monkeypatch.setattr(s, "_langsearch", lambda *a, **k: [])
+    monkeypatch.setattr(s, "_pages_tavily", lambda q, d, n, c: [{"title": "T", "url": "https://www.interviewbit.com/x/", "body": "text"}])
+    assert s.pages("q", ["interviewbit.com"])[0]["url"] == "https://www.interviewbit.com/x/"
+    assert _search_with().pages("q", []) == []
+
+
+def test_study_links_point_at_official_current_docs():
+    from src.langgraphagenticai.coach.search import canonical_url
+    assert canonical_url("https://developers.google.cn/machine-learning/crash-course/linear-regression") == \
+        "https://developers.google.com/machine-learning/crash-course/linear-regression"
+    assert canonical_url("https://docs.python.org/release/3.9.16/library/typing.html") == \
+        "https://docs.python.org/3/library/typing.html"
+    assert canonical_url("https://docs.python.org/3.8/library/asyncio.html") == "https://docs.python.org/3/library/asyncio.html"
+    assert canonical_url("https://docs.python.org/3/library/asyncio.html") == "https://docs.python.org/3/library/asyncio.html"
+    assert canonical_url("https://pandas.pydata.org/pandas-docs/version/2.0/user_guide/advanced.html") == \
+        "https://pandas.pydata.org/docs/user_guide/advanced.html"
+    assert canonical_url("https://scikit-learn.org/0.24/modules/svm.html") == "https://scikit-learn.org/stable/modules/svm.html"
+    assert canonical_url("https://realpython.com/python-3-9/") == "https://realpython.com/python-3-9/"
+
+
+def test_checkpointer_knows_session_types():
+    from src.langgraphagenticai.coach.graph import _serde
+    from src.langgraphagenticai.coach.state import QuizQuestion
+    serde = _serde()
+    assert serde is not None
+    q = QuizQuestion(question="q", options=["a", "b", "c", "d"], answer_index=1)
+    assert serde.loads_typed(serde.dumps_typed(q)) == q
+
+
+class _Flaky:
+    """Fails with the given errors in order, then answers."""
+
+    def __init__(self, errors):
+        self.errors, self.calls = list(errors), []
+
+    def with_structured_output(self, schema, **kwargs):
+        llm = self
+
+        class Chain:
+            def invoke(self, prompt):
+                llm.calls.append((kwargs.get("method", "tool"), "single valid JSON object" in prompt))
+                if llm.errors:
+                    raise llm.errors.pop(0)
+                return N._Summary(summary="ok", next_steps=[])
+        return Chain()
+
+
+def test_malformed_output_gets_one_more_json_try():
+    llm = _Flaky([RuntimeError("Error code: 400 - json_validate_failed"),
+                  RuntimeError("Error code: 400 - tool_use_failed: model did not call a tool")])
+    assert CoachNodes(llm)._ask(N._Summary, "summarise").summary == "ok"
+    assert llm.calls == [("json_mode", False), ("tool", False), ("json_mode", True)]   # third try has the reminder
+
+
+def test_other_errors_do_not_get_the_extra_try():
+    llm = _Flaky([RuntimeError("401 invalid api key"), RuntimeError("401 invalid api key")])
+    try:
+        CoachNodes(llm)._ask(N._Summary, "summarise")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected the error")
+    assert len(llm.calls) == 2
+
+
+
+def test_exhausted_primary_model_is_skipped_for_a_while(monkeypatch):
+    class OutOfQuota:
+        calls = 0
+
+        def with_structured_output(self, schema, **kwargs):
+            outer = self
+
+            class Chain:
+                def invoke(self, prompt):
+                    outer.calls += 1
+                    raise RuntimeError("Rate limit reached ... tokens per day (TPD): Limit 200000")
+            return Chain()
+
+    primary, backup = OutOfQuota(), FakeLLM()
+    nodes = CoachNodes(primary, fallback_llm=backup)
+    nodes._ask(N._Summary, "one")
+    nodes._ask(N._Summary, "two")
+    assert primary.calls == 1 and backup.calls == ["_Summary", "_Summary"]   # second call skipped the primary
+
+    import src.langgraphagenticai.coach.nodes as nodes_mod
+    later = nodes_mod.time.time() + nodes.PRIMARY_QUOTA_PAUSE + 1
+    monkeypatch.setattr(nodes_mod.time, "time", lambda: later)
+    nodes._ask(N._Summary, "three")
+    assert primary.calls == 2                                                # tried again after the pause
+
+
+def test_rate_limited_key_hands_over_to_the_next_without_waiting(monkeypatch):
+    class Limited:
+        def __init__(self, name, error=None):
+            self.name, self.error, self.calls = name, error, 0
+
+        def with_structured_output(self, schema, **kwargs):
+            llm = self
+
+            class Chain:
+                def invoke(self, prompt):
+                    llm.calls += 1
+                    if llm.error:
+                        raise Exception(llm.error)
+                    return N._Summary(summary=llm.name, next_steps=[])
+            return Chain()
+
+    monkeypatch.setattr(N.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("must not wait")))
+    key1 = Limited("key1", "Error code: 429 - rate limit reached for tokens per minute (TPM)")
+    key2 = Limited("key2")
+    nodes = CoachNodes(key1, fallback_llm=[key2])
+    assert nodes._ask(N._Summary, "p").summary == "key2"
+    assert nodes._ask(N._Summary, "p").summary == "key2" and key1.calls == 1   # key1 paused for a minute
+
+
+def test_groq_keys_are_collected_in_order_without_duplicates(monkeypatch):
+    from src.langgraphagenticai.LLMS import groqllm
+    monkeypatch.setattr(groqllm, "load_dotenv", lambda: None)
+    for k in [k for k in __import__("os").environ if k.startswith("GROQ_API_KEY")]:
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("GROQ_API_KEY", "a")
+    monkeypatch.setenv("GROQ_API_KEY_2", "c")
+    monkeypatch.setenv("GROQ_API_KEY_1", "b")
+    monkeypatch.setenv("GROQ_API_KEY_3", "a")
+    assert groqllm.groq_api_keys() == ["a", "b", "c"]
