@@ -217,15 +217,31 @@ def test_resume_rated_once_per_skill_and_reused():
     assert len(calls) == 3                                                    # different resume: rated fresh
 
 
-def test_plan_prefetches_web_questions_for_the_interview():
+def _three_skill_state(**kw):
+    return CoachState(candidate_id="c", resume_text="r", target_role="Dev", interview_turns=4, skills=[
+        SkillLevel(skill="Docker", required_level=3, jd_weight=0.8, level=1),
+        SkillLevel(skill="SQL", required_level=3, jd_weight=0.6, level=1),
+        SkillLevel(skill="Python", required_level=3, jd_weight=1.0, level=3),   # no gap
+    ], **kw)
+
+
+def test_plan_retrieves_no_questions():
     from test_coach_graph import FakeLLM
     web = FakeWeb()
     nodes = CoachNodes(FakeLLM(), web_questions=web)
-    state = CoachState(candidate_id="c", resume_text="r", target_role="Dev", skills=[
-        SkillLevel(skill="Docker", required_level=3, jd_weight=0.8, level=1),
-        SkillLevel(skill="SQL", required_level=3, jd_weight=0.6, level=1),
-        SkillLevel(skill="Python", required_level=3, jd_weight=1.0, level=3),   # no gap, still interviewed
-    ])
-    plan = nodes.plan(state)["plan"]
+    plan = nodes.plan(_three_skill_state())["plan"]
     assert [p.skill for p in plan] == ["Docker", "SQL"]
-    assert web.prefetched[:2] == ["Docker", "SQL"] and "Python" in web.prefetched
+    assert web.prefetched == []
+
+
+def test_interview_start_retrieves_questions_for_its_skills():
+    from test_coach_graph import FakeLLM
+    web = FakeWeb()
+    nodes = CoachNodes(FakeLLM(), web_questions=web)
+    state = _three_skill_state()
+    out = nodes.interview_ask(state)
+    assert web.prefetched == ["Docker", "SQL"]               # only skills the interview will ask about
+    # Later questions do not start retrieval again.
+    web.prefetched = []
+    nodes.interview_ask(state.model_copy(update=out))
+    assert web.prefetched == []

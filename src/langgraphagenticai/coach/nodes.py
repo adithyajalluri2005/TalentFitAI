@@ -346,26 +346,9 @@ JOB DESCRIPTION:
     MAX_PLAN_SKILLS = 4
     MAX_TOPICS = 4
 
-    # Skills whose web questions are retrieved in the background once the plan
-    # is ready, so the interview (which only reads the cache) has sourced
-    # questions for them.
-    PREFETCH_SKILLS = 6  # at most; each skill costs a few model calls
-
-    def _prefetch(self, state: CoachState, plan_skills: List[str]) -> None:
-        if not self.web_questions or not hasattr(self.web_questions, "prefetch"):
-            return
-        # The interviewer favours the same skills interview_ask does.
-        likely = sorted(state.skills, key=lambda s: scoring.priority(s) + s.jd_weight * 0.5, reverse=True)
-        names = list(dict.fromkeys(plan_skills + [s.skill for s in likely]))[:self.PREFETCH_SKILLS]
-        try:
-            self.web_questions.prefetch(names, self._ask)
-        except Exception as e:  # questions then come from the model; never fail the plan for it
-            logger.warning("web question prefetch failed: %s", e)
-
     def plan(self, state: CoachState) -> dict:
         gaps = sorted((s for s in state.skills if s.gap > 0), key=scoring.priority, reverse=True)[:self.MAX_PLAN_SKILLS]
         if not gaps:
-            self._prefetch(state, [])
             return {"plan": [], "checkpoint_queue": []}
 
         outline = self._outline(state, gaps)
@@ -393,10 +376,10 @@ JOB DESCRIPTION:
             ]
             plan.append(SkillTopics(skill=sk.skill, topics=topics,
                                     resources=chosen(f"s{si}", (("course",), ("github",)))))
-        # Started after the plan's own model calls, so it does not compete with them.
-        self._prefetch(state, [p.skill for p in plan])
-        # No questions are generated here: the plan is what the candidate waits
-        # for. Each assessment is built when the candidate asks for it.
+        # No questions are generated or retrieved here, not even in the
+        # background: that would use up the model's rate limit while the
+        # candidate studies. Each assessment is built when the candidate asks
+        # for it, and interview questions when the interview starts.
         return {"plan": plan, "checkpoint_queue": [p.skill for p in plan], "status": "learning"}
 
     def _outline(self, state: CoachState, gaps: List[SkillLevel]) -> List[_SkillOutline]:
@@ -695,9 +678,34 @@ explanation says briefly why it is correct.{avoid}
 
     # ---------------- adaptive interview ---------------- #
 
+    # Seconds the first interview question waits for its skill's web questions
+    # before the model asks without seeds.
+    INTERVIEW_WEB_WAIT = 25
+
+    @staticmethod
+    def _next_skill(skills: List[SkillLevel], asked: Dict[str, int]) -> SkillLevel:
+        # Highest-priority skill, rotated so one weak skill does not take every turn.
+        return max(skills, key=lambda s: (scoring.priority(s) + s.jd_weight * 0.5) / (1 + asked.get(s.skill, 0)))
+
+    def _interview_skills(self, state: CoachState) -> List[str]:
+        """The skills the main interview questions will be on, in order."""
+        asked: Dict[str, int] = {}
+        for _ in range(state.interview_turns):
+            s = self._next_skill(state.skills, asked).skill
+            asked[s] = asked.get(s, 0) + 1
+        return list(asked)
+
     def interview_ask(self, state: CoachState) -> dict:
         turns = state.interview
         last = turns[-1] if turns else None
+
+        if not turns and self.web_questions and hasattr(self.web_questions, "prefetch"):
+            # The interview is starting: retrieve web questions for every skill it
+            # will cover. The later skills are ready while the first is answered.
+            try:
+                self.web_questions.prefetch(self._interview_skills(state), self._ask)
+            except Exception as e:  # questions then come from the model; never fail the interview for it
+                logger.warning("web question prefetch failed: %s", e)
 
         if last and last.needs_follow_up and not last.is_follow_up:
             skill, follow_up = _skill(state, last.skill), True
@@ -705,8 +713,7 @@ explanation says briefly why it is correct.{avoid}
             asked = {t.skill: 0 for t in turns}
             for t in turns:
                 asked[t.skill] += 1
-            # Highest-priority skill, rotated so one weak skill does not take every turn.
-            skill = max(state.skills, key=lambda s: (scoring.priority(s) + s.jd_weight * 0.5) / (1 + asked.get(s.skill, 0)))
+            skill = self._next_skill(state.skills, asked)
             follow_up = False
 
         difficulty = max(1, min(5, round(skill.level) + 1))
@@ -718,9 +725,11 @@ Interviewer's note: {last.feedback}
 Probe the specific weak point; do not repeat the question."""
         else:
             if self.web_questions:
-                # Cached only: the candidate is mid-interview. A miss starts
-                # retrieval in the background for later questions.
-                web = self.web_questions.harvest(skill.skill, self._ask, wait=0)[0]
+                # The first question waits briefly for retrieval; later ones read
+                # what is ready (retrieval started with the interview) and never
+                # keep the candidate waiting mid-interview.
+                wait = 0 if turns else self.INTERVIEW_WEB_WAIT
+                web = self.web_questions.harvest(skill.skill, self._ask, wait=wait)[0]
                 seeds = pick_seeds(web, skill.skill, difficulty, used_ids=[t.bank_id for t in state.interview])
         if seeds:
             context = (f"SEED QUESTIONS from interview-prep sites. Build your question on ONE of them and set seed to its number.\n"
