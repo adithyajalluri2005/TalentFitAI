@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from pypdf import PdfReader
 
@@ -93,7 +94,7 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
         tracks = roles.list()
         union = list({s.skill.lower(): s for r in tracks for s in r.skills}.values())
         try:
-            rated = {s.skill.lower(): s for s in nodes.rate_resume(text, union)}
+            rated = {s.skill.lower(): s for s in await run_in_threadpool(nodes.rate_resume, text, union)}
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Resume rating failed: {e}")
         results = []
@@ -137,7 +138,9 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
         )
         thread_id = str(uuid.uuid4())
         try:
-            return with_topics(coach.start(thread_id, state))
+            # The graph makes LLM calls for a minute or more: run it off the event
+            # loop so /health keeps answering (Render kills the instance otherwise).
+            return with_topics(await run_in_threadpool(coach.start, thread_id, state))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Coaching session failed to start: {e}")
 
@@ -156,7 +159,8 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
         result, error = None, None
         for key in keys:  # next key when one is out of quota or rate limited
             try:
-                result = Groq(api_key=key).audio.transcriptions.create(
+                result = await run_in_threadpool(
+                    Groq(api_key=key).audio.transcriptions.create,
                     file=(file.filename or "answer.webm", content),
                     model="whisper-large-v3-turbo", response_format="verbose_json", language="en",
                 )

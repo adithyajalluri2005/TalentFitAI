@@ -405,6 +405,48 @@ def test_topic_tick_endpoint(tmp_path):
     assert client.post(f"/coach/{tid}/topics", json={"skill": "Docker", "topic_index": 9, "done": True}).status_code == 422
 
 
+def test_start_does_not_block_health(tmp_path, monkeypatch):
+    """Starting a session runs LLM calls for a minute. It must not block the
+    event loop: Render kills the instance when /health stops answering."""
+    import asyncio
+    import time as _time
+    import httpx
+    from fastapi import FastAPI
+    import coach_api
+
+    coach_api.SourceSearch = lambda: None   # no network in tests
+    times = {}
+
+    def slow_start(self, tid, state):          # stands in for a minute of LLM calls
+        times["started"] = _time.monotonic()
+        _time.sleep(1.5)
+        times["ended"] = _time.monotonic()
+        return {"thread_id": tid, "state": {"cycle": 0}}
+
+    monkeypatch.setattr(CoachGraph, "start", slow_start)
+    app = FastAPI()
+    app.include_router(coach_api.build_coach_router(FakeLLM(), str(tmp_path / "c.db")))
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+            start = asyncio.create_task(client.post(
+                "/coach/start", data={"candidate_id": "c", "jd_text": "x" * 60},
+                files={"resume": ("r.pdf", _tiny_pdf(), "application/pdf")}))
+            while "started" not in times:               # wait until /start is in the slow part
+                await asyncio.sleep(0.01)
+            assert (await client.get("/health")).status_code == 200
+            health_done = _time.monotonic()
+            assert (await start).status_code == 200
+            return health_done
+
+    # /health answered while /start was still running, not after it.
+    assert asyncio.run(run()) < times["ended"]
+
+
 def _tiny_pdf() -> bytes:
     content = "BT /F1 11 Tf 50 750 Td (Python developer resume) Tj ET"
     objs = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
