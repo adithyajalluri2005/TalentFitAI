@@ -129,9 +129,8 @@ def test_coach_uses_web_questions_with_sources(tmp_path):
     nodes = CoachNodes(RecordingLLM(llm_reply), web_questions=web)
 
     quiz = nodes.make_checkpoint(_state(checkpoint_queue=["SQL"]))["current_quiz"]
-    # The two pages give 6 verified questions; the model writes the other 4.
-    assert len(quiz) == 10 and all(q.source_url in (GFG, IB) for q in quiz[:6])
-    assert [q.question for q in quiz[6:]] == ["g0", "g1", "g2", "g3"]
+    # The two pages give 6 verified questions: enough for a quiz of sourced questions only.
+    assert len(quiz) == 6 and all(q.source_url in (GFG, IB) for q in quiz)
 
     turn = nodes.interview_ask(_state())["interview"][-1]
     assert turn.source_url in (GFG, IB) and turn.key_points == ["unique per row", "not NULL"]
@@ -226,3 +225,11 @@ def test_refers_to_source_drops_page_dependent_questions():
     assert not refers_to_source("What happens on a page fault, and how does the page table help?")
     assert not refers_to_source("Describe the LRU page replacement algorithm.")
     assert not refers_to_source("What is the time complexity of merging k sorted arrays with a heap?")
+
+
+def test_topic_name_drops_bracketed_qualifiers():
+    from src.langgraphagenticai.coach.web_questions import topic_name
+    assert topic_name("Deep Learning (PyTorch/TensorFlow)") == "Deep Learning"
+    assert topic_name("Testing (pytest)") == "pytest"            # "Testing" alone is too vague
+    assert topic_name("Django or FastAPI/Flask") == "Django or FastAPI/Flask"
+    assert topic_name("SQL") == "SQL"

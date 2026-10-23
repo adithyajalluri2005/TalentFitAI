@@ -187,6 +187,19 @@ def on_page(evidence: str, page_norm: str) -> bool:
     return len(e.split()) >= 5 and e in page_norm
 
 
+def topic_name(skill: str) -> str:
+    """The name pages use for a skill. Role tracks qualify skills in brackets,
+    e.g. "Deep Learning (PyTorch/TensorFlow)": searched or prompted with the
+    qualifier, a general Deep Learning page is judged off-topic and yields no
+    questions. A one-word base is too vague ("Testing (pytest)"): use the
+    qualifier instead."""
+    base = re.sub(r"\s*\([^)]*\)", "", skill).strip()
+    inner = re.findall(r"\(([^)]*)\)", skill)
+    if inner and len(base.split()) < 2:
+        return inner[0].strip()
+    return base or skill
+
+
 def _site(url: str) -> Optional[str]:
     return next((s for s in QUESTION_SITES if s in url.lower()), None)
 
@@ -314,7 +327,7 @@ class WebQuestions:
     def _pages(self, skill: str) -> List[dict]:
         """Up to PAGES_PER_SKILL pages, one per site where possible. Each has a
         url and, when the search API provided it, the page ``text``."""
-        query = f"{skill} interview questions"
+        query = f"{topic_name(skill)} interview questions"
         with_text = getattr(self.search, "pages", None)
         hits = with_text(query, list(QUESTION_SITES), n=6, text_chars=PAGE_CHARS,
                          keep=lambda h: _relevant(h, skill)) if with_text else []
@@ -363,7 +376,8 @@ class WebQuestions:
     def _ask_page(self, ask: Ask, schema, task: str, skill: str, url: str, text: str):
         """One extraction call; None on failure. Interview and quiz questions are
         asked for separately: one long combined answer made the model drift into
-        a markdown table instead of JSON, losing the whole page."""
+        a markdown table instead of JSON, losing the whole page. ``skill`` is
+        the topic_name."""
         try:
             return ask(schema, f"""
 Below is the text of a web page about {skill} interview questions. Using ONLY this page:
@@ -383,14 +397,25 @@ PAGE ({url}):
             return None
 
     def _extract(self, skill: str, url: str, source: str, text: str, ask: Ask) -> Tuple[List[SourcedQuestion], List[SourcedMCQ]]:
-        iq = self._ask_page(ask, _WebInterviewSet, f"""interview: up to 8 spoken interview questions on {skill} that the page asks and answers.
+        name = topic_name(skill)
+        def interview():
+            return self._ask_page(ask, _WebInterviewSet, f"""interview: up to 8 spoken interview questions on {name} that the page asks and answers.
 Keep each question close to the page's wording. key_points: 2-5 points a strong answer covers, in your
-own words, taken from the page's answer.""", skill, url, text)
-        mq = self._ask_page(ask, _WebMCQSet, f"""mcqs: up to 6 multiple-choice questions on {skill} testing facts the page explains. Four
+own words, taken from the page's answer.""", name, url, text)
+
+        def assessment():
+            mq = self._ask_page(ask, _WebMCQSet, f"""mcqs: up to 6 multiple-choice questions on {name} testing facts the page explains. Four
 distinct options of which EXACTLY ONE is correct and the other three are clearly wrong per the page.
 answer_index is the 0-based correct option; explanation is one line in your own words that agrees with
-the correct option's wording.""", skill, url, text)
-        checked = self._verify(ask, skill, url, text, mq.mcqs) if mq and mq.mcqs else ([] if mq else None)
+the correct option's wording.""", name, url, text)
+            return self._verify(ask, name, url, text, mq.mcqs) if mq and mq.mcqs else ([] if mq else None)
+
+        # Side by side: one after the other they made a skill's retrieval take
+        # minutes, longer than a candidate waits before taking the assessment.
+        with ThreadPoolExecutor(max_workers=1) as side:
+            pending = side.submit(interview)
+            checked = assessment()
+            iq = pending.result()
         out = SimpleNamespace(interview=iq.interview if iq else [], mcqs=checked or [])
         complete = iq is not None and checked is not None
 

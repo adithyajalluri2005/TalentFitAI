@@ -31,7 +31,10 @@ class GroqLLM:
             if not groq_api_key:
                 raise ValueError("GROQ_API_KEY environment variable not set.")
             # Use the model_name from the instance variable
-            llm = ChatGroq(api_key=groq_api_key, model=self.model_name)
+            # No SDK retries: on a 429 the Groq client sleeps out retry-after
+            # (tens of seconds) before raising. CoachNodes._ask handles rate
+            # limits itself and switches to another key or model at once.
+            llm = ChatGroq(api_key=groq_api_key, model=self.model_name, max_retries=0)
         except Exception as e:
             raise ValueError(f"Error occurred with exception: {e}")
         return llm

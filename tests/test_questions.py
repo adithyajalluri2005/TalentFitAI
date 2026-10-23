@@ -172,20 +172,20 @@ def _quiz_reply(schema, prompt, prefix):
 def test_checkpoint_uses_web_questions_and_model_fills_the_rest():
     from src.langgraphagenticai.coach.state import SkillTopics, Topic
 
-    assert CoachNodes.QUIZ_SIZE == 10
-    web = FakeWeb(mcqs=[_mcq(f"m{i}", 3, f"T{i}", options=("right", "a", "b", "c")) for i in range(6)])
+    assert CoachNodes.QUIZ_SIZE == 10 and CoachNodes.QUIZ_MIN_WEB == 5
+    web = FakeWeb(mcqs=[_mcq(f"m{i}", 3, f"T{i}", options=("right", "a", "b", "c")) for i in range(3)])
     llm = RecordingLLM(lambda schema, p: _quiz_reply(schema, p, "g"))
     nodes = CoachNodes(llm, web_questions=web)
-    state = _state(checkpoint_queue=["SQL"], plan=[SkillTopics(skill="SQL", topics=[Topic(title="T5 stuff")])])
+    state = _state(checkpoint_queue=["SQL"], plan=[SkillTopics(skill="SQL", topics=[Topic(title="T2 stuff")])])
 
     out = nodes.make_checkpoint(state)
     quiz = out["current_quiz"]
-    assert len(quiz) == 10 and quiz[0].bank_id == "m5"             # studied topic first
-    web_part, model_part = quiz[:6], quiz[6:]
+    assert len(quiz) == 10 and quiz[0].bank_id == "m2"             # studied topic first
+    web_part, model_part = quiz[:3], quiz[3:]
     assert all(q.options[q.answer_index] == "right" and q.source_url for q in web_part)
-    assert [q.question for q in model_part] == ["g0", "g1", "g2", "g3"] and all(q.source_url == "" for q in model_part)
-    # The model writes only the missing 4 and is told not to repeat the web ones.
-    assert "exactly 4 multiple-choice" in llm.prompts[-1] and "mcq m5?" in llm.prompts[-1]
+    assert [q.question for q in model_part] == [f"g{i}" for i in range(7)] and all(q.source_url == "" for q in model_part)
+    # Too few web questions: the model writes the missing 7 and is told not to repeat the web ones.
+    assert "exactly 7 multiple-choice" in llm.prompts[-1] and "mcq m2?" in llm.prompts[-1]
     assert "This is a retake" not in llm.prompts[-1]
 
     answers = [q.answer_index for q in quiz[:9]] + [(quiz[9].answer_index + 1) % 4]
@@ -193,7 +193,7 @@ def test_checkpoint_uses_web_questions_and_model_fills_the_rest():
     result = graded["checkpoints"][-1]
     assert result.score == 0.9 and len(result.review) == 10
     assert result.review[9].chosen != result.review[9].answer_index
-    assert result.review[0].source_name == "InterviewBit" and result.review[0].explanation == "because m5"
+    assert result.review[0].source_name == "InterviewBit" and result.review[0].explanation == "because m2"
 
     # A retake skips web questions already used; none left -> the model writes all 10, avoiding the earlier ones.
     nodes.llm = RecordingLLM(lambda schema, p: _quiz_reply(schema, p, "r"))
@@ -201,14 +201,15 @@ def test_checkpoint_uses_web_questions_and_model_fills_the_rest():
     assert [q.question for q in again] == [f"r{i}" for i in range(10)]
     assert all(q.source_url == "" for q in again)
     assert "exactly 10 multiple-choice" in nodes.llm.prompts[-1]
-    assert "This is a retake" in nodes.llm.prompts[-1] and "mcq m5?" in nodes.llm.prompts[-1]
+    assert "This is a retake" in nodes.llm.prompts[-1] and "mcq m2?" in nodes.llm.prompts[-1]
 
 
-def test_full_web_quiz_needs_no_model():
-    web = FakeWeb(mcqs=[_mcq(f"m{i}", 3, f"T{i}") for i in range(12)])
+def test_enough_web_questions_make_a_sourced_only_quiz():
     llm = RecordingLLM(lambda schema, p: (_ for _ in ()).throw(AssertionError("model must not write the quiz")))
-    quiz = CoachNodes(llm, web_questions=web).make_checkpoint(_state(checkpoint_queue=["SQL"]))["current_quiz"]
-    assert len(quiz) == 10 and all(q.source_url for q in quiz)
+    for n, size in ((6, 6), (12, 10)):
+        web = FakeWeb(mcqs=[_mcq(f"m{i}", 3, f"T{i}") for i in range(n)])
+        quiz = CoachNodes(llm, web_questions=web).make_checkpoint(_state(checkpoint_queue=["SQL"]))["current_quiz"]
+        assert len(quiz) == size and all(q.source_url for q in quiz)
 
 
 def test_short_model_quiz_is_rejected_not_shrunk():
@@ -260,13 +261,13 @@ def _three_skill_state(**kw):
     ], **kw)
 
 
-def test_plan_retrieves_no_questions():
+def test_plan_starts_question_retrieval_for_its_skills():
     from test_coach_graph import FakeLLM
     web = FakeWeb()
     nodes = CoachNodes(FakeLLM(), web_questions=web)
     plan = nodes.plan(_three_skill_state())["plan"]
     assert [p.skill for p in plan] == ["Docker", "SQL"]
-    assert web.prefetched == []
+    assert web.prefetched == ["Docker", "SQL"]              # priority order, while the candidate studies
 
 
 def test_interview_start_retrieves_questions_for_its_skills():

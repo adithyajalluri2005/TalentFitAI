@@ -386,11 +386,17 @@ JOB DESCRIPTION:
             ]
             plan.append(SkillTopics(skill=sk.skill, topics=topics,
                                     resources=chosen(f"s{si}", (("course",), ("github",)))))
-        # No questions are generated or retrieved here, not even in the
-        # background: that would use up the model's rate limit while the
-        # candidate studies. Each assessment is built when the candidate asks
-        # for it, and interview questions when the interview starts.
-        return {"plan": plan, "checkpoint_queue": [p.skill for p in plan], "status": "learning"}
+        queue = [p.skill for p in plan]
+        # Retrieve web questions in the background while the candidate studies,
+        # highest priority first. Retrieval takes a minute or more per skill;
+        # started only when an assessment was asked for, it was never ready in
+        # time and every quiz was model-written, with no sources.
+        if self.web_questions and hasattr(self.web_questions, "prefetch"):
+            try:
+                self.web_questions.prefetch(queue, self._ask)
+            except Exception as e:
+                logger.warning("web question prefetch failed: %s", e)
+        return {"plan": plan, "checkpoint_queue": queue, "status": "learning"}
 
     def _outline(self, state: CoachState, gaps: List[SkillLevel]) -> List[_SkillOutline]:
         gap_lines = "\n".join(
@@ -534,8 +540,11 @@ Return one entry per key, candidate ids exactly as shown (e.g. "t{si}.0.2"), bes
     # skill before using a model-written quiz (retrieval goes on in the
     # background and serves the next candidate).
     QUIZ_WEB_WAIT = 25
-    # Questions in every assessment: web questions first, the model writes the rest.
+    # Questions in an assessment: web questions first, the model writes the rest.
     QUIZ_SIZE = 10
+    # With at least this many web questions the assessment is web questions
+    # only (shorter, but every question sourced and no slow model call).
+    QUIZ_MIN_WEB = 5
 
     @staticmethod
     def retakeable(state: CoachState) -> List[str]:
@@ -599,10 +608,9 @@ Return one entry per key, candidate ids exactly as shown (e.g. "t{si}.0.2"), bes
                     bank_id=q.id, source_name=q.source_name, source_url=q.source_url,
                 ))
 
-        missing = self.QUIZ_SIZE - len(questions)
+        missing = 0 if len(questions) >= self.QUIZ_MIN_WEB else self.QUIZ_SIZE - len(questions)
         if missing:
-            # Sites rarely give a full quiz's worth of verified questions for a
-            # skill: the model writes the rest, so every assessment is the same size.
+            # Too few verified web questions for the skill: the model writes the rest.
             scope = ("Spread the questions evenly across these study topics:\n"
                      + "\n".join(f"- {t}" for t in topics)) if topics else "Cover the skill broadly."
             avoid = ""
