@@ -387,13 +387,15 @@ JOB DESCRIPTION:
             plan.append(SkillTopics(skill=sk.skill, topics=topics,
                                     resources=chosen(f"s{si}", (("course",), ("github",)))))
         queue = [p.skill for p in plan]
-        # Retrieve web questions in the background while the candidate studies,
-        # highest priority first. Retrieval takes a minute or more per skill;
-        # started only when an assessment was asked for, it was never ready in
-        # time and every quiz was model-written, with no sources.
+        # Retrieve web questions in the background while the candidate studies:
+        # assessment skills by priority, then any other skill the interview
+        # will cover. Retrieval takes a minute or more per skill; started only
+        # when an assessment was asked for, it was never ready in time and
+        # every quiz was model-written, with no sources.
         if self.web_questions and hasattr(self.web_questions, "prefetch"):
             try:
-                self.web_questions.prefetch(queue, self._ask)
+                later = [s for s in self._interview_skills(state) if s not in queue]
+                self.web_questions.prefetch(queue + later, self._ask)
             except Exception as e:
                 logger.warning("web question prefetch failed: %s", e)
         return {"plan": plan, "checkpoint_queue": queue, "status": "learning"}

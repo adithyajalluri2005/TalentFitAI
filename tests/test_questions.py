@@ -269,6 +269,12 @@ def test_plan_starts_question_retrieval_for_its_skills():
     assert [p.skill for p in plan] == ["Docker", "SQL"]
     assert web.prefetched == ["Docker", "SQL"]              # priority order, while the candidate studies
 
+    # An interview skill with no gap (not assessed) is retrieved too, after the assessed ones.
+    web.prefetched = []
+    nodes._interview_skills = lambda state: ["SQL", "Python", "Docker"]
+    nodes.plan(_three_skill_state())
+    assert web.prefetched == ["Docker", "SQL", "Python"]
+
 
 def test_interview_start_retrieves_questions_for_its_skills():
     from test_coach_graph import FakeLLM

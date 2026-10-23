@@ -38,6 +38,7 @@ export default function Session() {
   const { toast } = useToast();
   const [view, setView] = useState<SessionView | null>(null);
   const [busy, setBusy] = useState(false);
+  const [startingInterview, setStartingInterview] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
@@ -71,6 +72,11 @@ export default function Session() {
   }, [threadId, toast]);
 
   const respond = useCallback(async (payload: RespondPayload) => {
+    // Starting the interview (also "skip to interview" from an assessment):
+    // show the interview tab's loading state, not "Preparing your assessment".
+    const opensInterview = payload.action === 'interview' || payload.action === 'skip_all';
+    if (opensInterview && tab !== 'interview') navigate(`/session/${threadId}/interview`);
+    setStartingInterview(opensInterview);
     setBusy(true);
     try {
       const before = view?.state.history.length ?? 0;
@@ -83,13 +89,14 @@ export default function Session() {
       // The last interview answer opens the results on the interview tab.
       const interviewEnded = (payload.answer !== undefined || (tab === 'interview' && (payload.action === 'skip' || payload.action === 'end')))
         && next.state.history.length > before;
-      const target = graded ? 'checkpoints' : interviewEnded ? 'interview' : tabFor(next);
-      if (target !== tab) navigate(`/session/${threadId}/${target}`);
+      const target = graded ? 'checkpoints' : interviewEnded || opensInterview ? 'interview' : tabFor(next);
+      if (target !== (opensInterview ? 'interview' : tab)) navigate(`/session/${threadId}/${target}`);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (e) {
       toast({ title: 'Something went wrong', description: errorMessage(e), variant: 'destructive' });
     } finally {
       setBusy(false);
+      setStartingInterview(false);
     }
   }, [threadId, toast, view, tab, navigate]);
 
@@ -138,8 +145,8 @@ export default function Session() {
   };
   // Every assessment is done: write the first interview question and open the interview.
   const startInterview = () => {
-    goTo('interview');
     if (waiting?.type === 'study') respond({ action: 'interview' });
+    else goTo('interview');
   };
 
   const preparing = (
@@ -149,7 +156,13 @@ export default function Session() {
       <span className="text-xs">This takes a few seconds, up to half a minute for a skill's first assessment.</span>
     </CardContent></Card>
   );
-  const thinking = (
+  const thinking = startingInterview ? (
+    <Card><CardContent className="py-16 flex flex-col items-center gap-3 text-muted-foreground">
+      <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      <span>Preparing your interview…</span>
+      <span className="text-xs">Picking interview questions for your skills. This can take up to half a minute.</span>
+    </CardContent></Card>
+  ) : (
     <Card><CardContent className="py-16 flex flex-col items-center gap-3 text-muted-foreground">
       <Loader2 className="h-8 w-8 animate-spin text-primary" />
       <span>Your coach is thinking…</span>
