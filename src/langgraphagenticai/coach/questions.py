@@ -108,15 +108,13 @@ def pick_seeds(questions: Iterable[SourcedQuestion], skill: str, difficulty: int
 
 
 def pick_quiz(mcqs: Iterable[SourcedMCQ], skill: str, difficulty: int, topics: Iterable[str] = (),
-              used_ids: Iterable[str] = (), n: int = 4) -> List[SourcedMCQ]:
-    """``n`` unused assessment questions for ``skill``, or [] if there are
-    fewer (the caller then falls back to a model-written quiz). Prefers
-    questions on the studied ``topics`` and near ``difficulty``, and spreads
-    picks across page topics before taking two from the same one."""
+              used_ids: Iterable[str] = (), n: int = 10) -> List[SourcedMCQ]:
+    """Up to ``n`` unused assessment questions for ``skill`` (the caller has
+    the model write the rest). Prefers questions on the studied ``topics`` and
+    near ``difficulty``, and spreads picks across page topics before taking
+    two from the same one."""
     used = set(used_ids)
     fresh = [q for q in mcqs if q.id not in used and skill_matches(q.skill, skill)]
-    if len(fresh) < n:
-        return []
     studied = [_tokens(t) for t in topics]
 
     def overlap(q: SourcedMCQ) -> int:

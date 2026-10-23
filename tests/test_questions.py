@@ -1,4 +1,6 @@
 """Sourced questions: selection, and how web questions seed the interview and make up assessments."""
+import re
+
 from src.langgraphagenticai.coach import nodes as N
 from src.langgraphagenticai.coach import questions as Q
 from src.langgraphagenticai.coach.nodes import CoachNodes
@@ -133,16 +135,18 @@ def _mcq(id, difficulty=3, topic="", skill="SQL", options=("w", "x", "y", "z"), 
                       source_name="InterviewBit", source_url=f"https://www.interviewbit.com/{id}/")
 
 
-def test_quiz_prefers_studied_topics_spreads_topics_and_needs_enough_rows():
+def test_quiz_prefers_studied_topics_spreads_topics_and_takes_what_there_is():
     mcqs = [
         _mcq("j1", 3, "Joins"), _mcq("j2", 3, "Joins"), _mcq("j3", 2, "Joins"),
         _mcq("i1", 3, "Indexes"), _mcq("w1", 3, "Window functions"), _mcq("t1", 5, "Transactions"),
         _mcq("p1", 1, "Joins", skill="Python"),
     ]
-    picked = [q.id for q in pick_quiz(mcqs, "SQL", 3, topics=["SQL joins in depth", "Window functions"])]
+    picked = [q.id for q in pick_quiz(mcqs, "SQL", 3, topics=["SQL joins in depth", "Window functions"], n=4)]
     assert picked == ["w1", "j1", "i1", "t1"]   # best topic match first, then one per topic
-    assert [q.id for q in pick_quiz(mcqs, "SQL", 3, used_ids=["j1", "w1"])] == ["i1", "j2", "t1", "j3"]
-    assert pick_quiz(mcqs, "SQL", 3, used_ids=["j1", "j2", "j3"]) == []  # only 3 left: fall back to the model
+    assert [q.id for q in pick_quiz(mcqs, "SQL", 3, used_ids=["j1", "w1"], n=4)] == ["i1", "j2", "t1", "j3"]
+    # Fewer left than asked for: all of them (the model writes the rest).
+    assert [q.id for q in pick_quiz(mcqs, "SQL", 3, used_ids=["j1", "j2", "j3"], n=4)] == ["i1", "w1", "t1"]
+    assert len(pick_quiz(mcqs, "SQL", 3)) == 6                     # default size is a full assessment (10)
     assert pick_quiz(mcqs, "Kubernetes", 3) == []
 
 
@@ -159,33 +163,64 @@ def test_shuffle_is_stable_and_keeps_the_answer_but_not_positional_options():
     assert not Q._POSITIONAL.search("data and code") and not Q._POSITIONAL.search("A list of tuples")
 
 
-def test_checkpoint_uses_web_questions_then_reviews_with_sources():
+def _quiz_reply(schema, prompt, prefix):
+    n = int(re.search(r"exactly (\d+) multiple-choice", prompt).group(1))
+    return schema(questions=[N._QuizItem(question=f"{prefix}{i}", options=["a", "b", "c", "d"], answer_index=1)
+                             for i in range(n)])
+
+
+def test_checkpoint_uses_web_questions_and_model_fills_the_rest():
     from src.langgraphagenticai.coach.state import SkillTopics, Topic
 
+    assert CoachNodes.QUIZ_SIZE == 10
     web = FakeWeb(mcqs=[_mcq(f"m{i}", 3, f"T{i}", options=("right", "a", "b", "c")) for i in range(6)])
-    llm = RecordingLLM(lambda schema, p: (_ for _ in ()).throw(AssertionError("model must not write the quiz")))
+    llm = RecordingLLM(lambda schema, p: _quiz_reply(schema, p, "g"))
     nodes = CoachNodes(llm, web_questions=web)
     state = _state(checkpoint_queue=["SQL"], plan=[SkillTopics(skill="SQL", topics=[Topic(title="T5 stuff")])])
 
     out = nodes.make_checkpoint(state)
     quiz = out["current_quiz"]
-    assert len(quiz) == 4 and quiz[0].bank_id == "m5"              # studied topic first
-    assert all(q.options[q.answer_index] == "right" and q.source_url for q in quiz)
+    assert len(quiz) == 10 and quiz[0].bank_id == "m5"             # studied topic first
+    web_part, model_part = quiz[:6], quiz[6:]
+    assert all(q.options[q.answer_index] == "right" and q.source_url for q in web_part)
+    assert [q.question for q in model_part] == ["g0", "g1", "g2", "g3"] and all(q.source_url == "" for q in model_part)
+    # The model writes only the missing 4 and is told not to repeat the web ones.
+    assert "exactly 4 multiple-choice" in llm.prompts[-1] and "mcq m5?" in llm.prompts[-1]
+    assert "This is a retake" not in llm.prompts[-1]
 
-    answers = [q.answer_index for q in quiz[:3]] + [(quiz[3].answer_index + 1) % 4]
+    answers = [q.answer_index for q in quiz[:9]] + [(quiz[9].answer_index + 1) % 4]
     graded = nodes.grade_checkpoint(state.model_copy(update={**out, "quiz_answers": answers}))
     result = graded["checkpoints"][-1]
-    assert result.score == 0.75 and len(result.review) == 4
-    assert result.review[3].chosen != result.review[3].answer_index
+    assert result.score == 0.9 and len(result.review) == 10
+    assert result.review[9].chosen != result.review[9].answer_index
     assert result.review[0].source_name == "InterviewBit" and result.review[0].explanation == "because m5"
 
-    # A retake skips questions already used; too few left -> model quiz told to avoid the earlier ones.
-    nodes.llm = RecordingLLM(lambda schema, p: N._Quiz(questions=[
-        N._QuizItem(question=f"g{i}", options=["a", "b", "c", "d"], answer_index=1) for i in range(4)]))
-    again = nodes.make_checkpoint(state.model_copy(update={"checkpoints": [result]}))
-    assert [q.question for q in again["current_quiz"]] == ["g0", "g1", "g2", "g3"]
-    assert all(q.source_url == "" for q in again["current_quiz"])
+    # A retake skips web questions already used; none left -> the model writes all 10, avoiding the earlier ones.
+    nodes.llm = RecordingLLM(lambda schema, p: _quiz_reply(schema, p, "r"))
+    again = nodes.make_checkpoint(state.model_copy(update={"checkpoints": [result]}))["current_quiz"]
+    assert [q.question for q in again] == [f"r{i}" for i in range(10)]
+    assert all(q.source_url == "" for q in again)
+    assert "exactly 10 multiple-choice" in nodes.llm.prompts[-1]
     assert "This is a retake" in nodes.llm.prompts[-1] and "mcq m5?" in nodes.llm.prompts[-1]
+
+
+def test_full_web_quiz_needs_no_model():
+    web = FakeWeb(mcqs=[_mcq(f"m{i}", 3, f"T{i}") for i in range(12)])
+    llm = RecordingLLM(lambda schema, p: (_ for _ in ()).throw(AssertionError("model must not write the quiz")))
+    quiz = CoachNodes(llm, web_questions=web).make_checkpoint(_state(checkpoint_queue=["SQL"]))["current_quiz"]
+    assert len(quiz) == 10 and all(q.source_url for q in quiz)
+
+
+def test_short_model_quiz_is_rejected_not_shrunk():
+    schema = N._quiz_schema(4)
+    item = N._QuizItem(question="q", options=["a", "b", "c", "d"], answer_index=0)
+    for bad in (3, 7):
+        try:
+            schema(questions=[item] * bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} questions accepted for a 4-question quiz")
+    assert len(schema(questions=[item] * 5).questions) == 5        # a small overshoot is trimmed by the caller
 
 
 def test_too_easy_seed_is_raised_keeping_its_source():

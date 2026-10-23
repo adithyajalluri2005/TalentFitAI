@@ -121,13 +121,17 @@ def test_coach_uses_web_questions_with_sources(tmp_path):
         if schema is N._Question:
             assert "What is a primary key?" in prompt
             return N._Question(question="What is a primary key?", seed=0)
+        if issubclass(schema, N._Quiz):
+            return _quiz_reply(schema, prompt, "g")
         raise AssertionError(f"model must not write {schema.__name__}")
 
-    from test_questions import RecordingLLM
+    from test_questions import RecordingLLM, _quiz_reply
     nodes = CoachNodes(RecordingLLM(llm_reply), web_questions=web)
 
     quiz = nodes.make_checkpoint(_state(checkpoint_queue=["SQL"]))["current_quiz"]
-    assert len(quiz) == 4 and all(q.source_url in (GFG, IB) for q in quiz)
+    # The two pages give 6 verified questions; the model writes the other 4.
+    assert len(quiz) == 10 and all(q.source_url in (GFG, IB) for q in quiz[:6])
+    assert [q.question for q in quiz[6:]] == ["g0", "g1", "g2", "g3"]
 
     turn = nodes.interview_ask(_state())["interview"][-1]
     assert turn.source_url in (GFG, IB) and turn.key_points == ["unique per row", "not NULL"]

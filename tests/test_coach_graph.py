@@ -1,4 +1,6 @@
 """Drives a whole coaching session through every interrupt with a scripted LLM."""
+import re
+
 from src.langgraphagenticai.coach import nodes as N
 from src.langgraphagenticai.coach import scoring
 from src.langgraphagenticai.coach.graph import CoachGraph
@@ -60,8 +62,9 @@ class FakeLLM:
                     N._Pick(key="t0.1", picks=["t1.0.0"]),
                 ])
             return N._Curation(topics=[N._Pick(key="t1.0", picks=[])])
-        if schema is N._Quiz:
-            return N._Quiz(questions=[N._QuizItem(question=f"q{i}", options=["a", "b", "c", "d"], answer_index=0) for i in range(4)])
+        if issubclass(schema, N._Quiz):
+            n = int(re.search(r"exactly (\d+) multiple-choice", prompt).group(1))
+            return schema(questions=[N._QuizItem(question=f"q{i}", options=["a", "b", "c", "d"], answer_index=0) for i in range(n)])
         if schema is N._Question:
             return N._Question(question=f"question {prompt.count('FOLLOW-UP')}")
         if schema is N._Evaluation:
@@ -97,7 +100,7 @@ def test_session_is_single_pass_with_retakes_and_records_history():
     assert view["waiting_for"]["questions"][0]["source_url"] == ""   # model-written: no source
     assert "current_quiz" not in view["state"]
 
-    view = coach.respond("t1", {"answers": [1, 1, 0, 0]})       # Docker: half right
+    view = coach.respond("t1", {"answers": [1] * 5 + [0] * 5})       # Docker: half right
     assert view["waiting_for"]["type"] == "study" and view["waiting_for"]["pending"] == ["SQL"]
     assert view["waiting_for"]["retakeable"] == ["Docker"]
     half = view["readiness"]
@@ -106,7 +109,7 @@ def test_session_is_single_pass_with_retakes_and_records_history():
     # Retake Docker: the new score replaces the old one.
     view = coach.respond("t1", {"action": "retake", "skill": "Docker"})
     assert view["waiting_for"]["type"] == "checkpoint" and view["waiting_for"]["skill"] == "Docker"
-    view = coach.respond("t1", {"answers": [0, 0, 0, 0]})
+    view = coach.respond("t1", {"answers": [0] * 10})
     assert view["readiness"] > half
     docker = next(s for s in view["state"]["skills"] if s["skill"] == "Docker")
     assert [o["source"] for o in docker["observations"]] == ["resume", "checkpoint"]
@@ -148,7 +151,7 @@ def test_session_is_single_pass_with_retakes_and_records_history():
     assert [c["skipped"] for c in view["state"]["checkpoints"] if c["skill"] == "SQL"] == [True]
     before = view["state"]["history"][-1]["readiness"]
     view = coach.respond("t1", {"action": "retake", "skill": "SQL"})
-    view = coach.respond("t1", {"answers": [0, 0, 0, 0]})
+    view = coach.respond("t1", {"answers": [0] * 10})
     h = view["state"]["history"]
     assert len(h) == 2 and h[-1]["readiness"] > before
     assert view["waiting_for"]["type"] == "study"
@@ -314,7 +317,7 @@ def test_refresh_plan_keeps_pending_step():
     after = coach.refresh_plan("t5")
     assert [len(p["topics"]) for p in after["state"]["plan"]] == [2, 1]
     assert after["waiting_for"] == before["waiting_for"]       # same quiz still pending
-    view = coach.respond("t5", {"answers": [0, 0, 0, 0]})       # and it still resumes
+    view = coach.respond("t5", {"answers": [0] * 10})       # and it still resumes
     assert view["waiting_for"]["pending"] == ["SQL"]
 
 
@@ -362,7 +365,7 @@ def test_switch_assessment_order_then_resume_queue():
     assert view["waiting_for"]["type"] == "checkpoint" and view["waiting_for"]["skill"] == "SQL"
     assert view["state"]["switch_to"] is None
 
-    view = coach.respond("t7", {"answers": [0, 0, 0, 0]})              # pass SQL
+    view = coach.respond("t7", {"answers": [0] * 10})              # pass SQL
     assert view["waiting_for"]["pending"] == ["Docker"]                # back to studying the rest
     assert [c["skill"] for c in view["state"]["checkpoints"]] == ["SQL"]
 

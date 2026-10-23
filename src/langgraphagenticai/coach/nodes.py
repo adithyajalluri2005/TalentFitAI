@@ -6,6 +6,7 @@ LLM call placed before the interrupt would run twice; generating content and
 waiting for the answer are therefore always separate nodes.
 """
 import difflib
+import functools
 import hashlib
 import json
 import logging
@@ -16,7 +17,7 @@ from typing import Callable, Dict, List, Optional
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from src.langgraphagenticai.coach import scoring
 from src.langgraphagenticai.coach.questions import pick_quiz, pick_seeds
@@ -85,7 +86,16 @@ class _QuizItem(BaseModel):
 
 
 class _Quiz(BaseModel):
-    questions: List[_QuizItem] = Field(..., min_length=3, max_length=5)
+    questions: List[_QuizItem] = Field(..., min_length=1)
+
+
+@functools.lru_cache(maxsize=None)
+def _quiz_schema(n: int) -> type:
+    """_Quiz that must hold at least ``n`` questions, so a short reply fails
+    validation and is retried instead of shrinking the assessment. A couple
+    extra are allowed (models overshoot) and trimmed by the caller."""
+    return create_model("_Quiz", __base__=_Quiz,
+                        questions=(List[_QuizItem], Field(..., min_length=n, max_length=n + 2)))
 
 
 class _Question(BaseModel):
@@ -524,6 +534,8 @@ Return one entry per key, candidate ids exactly as shown (e.g. "t{si}.0.2"), bes
     # skill before using a model-written quiz (retrieval goes on in the
     # background and serves the next candidate).
     QUIZ_WEB_WAIT = 25
+    # Questions in every assessment: web questions first, the model writes the rest.
+    QUIZ_SIZE = 10
 
     @staticmethod
     def retakeable(state: CoachState) -> List[str]:
@@ -575,27 +587,33 @@ Return one entry per key, candidate ids exactly as shown (e.g. "t{si}.0.2"), bes
         # Questions from earlier attempts, so a retake gets new ones.
         earlier = [r for c in state.checkpoints if c.skill == skill.skill for r in c.review]
         attempt = sum(1 for c in state.checkpoints if c.skill == skill.skill)
-        picked = []
+        questions = []
         if self.web_questions:
             pool = self.web_questions.harvest(skill.skill, self._ask, wait=self.QUIZ_WEB_WAIT)[1]
             picked = pick_quiz(pool, skill.skill, skill.required_level, topics,
-                               used_ids=[r.bank_id for r in earlier if r.bank_id])
-        if picked:
-            questions = []
+                               used_ids=[r.bank_id for r in earlier if r.bank_id], n=self.QUIZ_SIZE)
             for q in picked:
                 options, answer = q.shuffled(seed=f"{state.candidate_id}|{attempt}")
                 questions.append(QuizQuestion(
                     question=q.question, options=options, answer_index=answer, explanation=q.explanation,
                     bank_id=q.id, source_name=q.source_name, source_url=q.source_url,
                 ))
-            return {"current_quiz_skill": skill.skill, "current_quiz": questions, "quiz_answers": [], "switch_to": None}
 
-        scope = ("Write ONE question for EACH of these study topics, in order:\n"
-                 + "\n".join(f"- {t}" for t in topics)) if topics else "Cover the skill broadly."
-        avoid = ("\nThis is a retake. Do not reuse or lightly reword these earlier questions:\n"
-                 + "\n".join(f"- {r.question}" for r in earlier)) if earlier else ""
-        quiz = self._ask(_Quiz, f"""
-Write a skill assessment: 4 multiple-choice questions checking whether a candidate has reached level
+        missing = self.QUIZ_SIZE - len(questions)
+        if missing:
+            # Sites rarely give a full quiz's worth of verified questions for a
+            # skill: the model writes the rest, so every assessment is the same size.
+            scope = ("Spread the questions evenly across these study topics:\n"
+                     + "\n".join(f"- {t}" for t in topics)) if topics else "Cover the skill broadly."
+            avoid = ""
+            if questions:
+                avoid += ("\nThe assessment already has these questions. Do not repeat or lightly reword them:\n"
+                          + "\n".join(f"- {q.question}" for q in questions))
+            if earlier:
+                avoid += ("\nThis is a retake. Do not reuse or lightly reword these earlier questions:\n"
+                          + "\n".join(f"- {r.question}" for r in earlier))
+            quiz = self._ask(_quiz_schema(missing), f"""
+Write a skill assessment: exactly {missing} multiple-choice questions checking whether a candidate has reached level
 {skill.required_level}/5 in {skill.skill} for a {state.target_role} role. The candidate has just studied the
 topics below. {scope}
 Use realistic, applied scenarios (code snippets welcome), not trivia or definitions. Put any code in a
@@ -603,7 +621,7 @@ fenced ``` block with real line breaks.
 Each question has exactly 4 options; answer_index is the 0-based index of the correct option;
 explanation says briefly why it is correct.{avoid}
 """)
-        questions = [QuizQuestion(**_unescape_quiz(q.model_dump())) for q in quiz.questions]
+            questions += [QuizQuestion(**_unescape_quiz(q.model_dump())) for q in quiz.questions[:missing]]
         return {"current_quiz_skill": skill.skill, "current_quiz": questions, "quiz_answers": [], "switch_to": None}
 
     def await_checkpoint(self, state: CoachState) -> dict:
