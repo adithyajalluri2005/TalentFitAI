@@ -102,6 +102,11 @@ class RubricScore(BaseModel):
 
 
 class InterviewTurn(BaseModel):
+    # "intro" (the opening "introduce yourself"), "resume" (on a project or
+    # achievement from the resume) or "skill" (on one of the role's skills).
+    # An intro turn's skill is "Introduction", which is not a role skill, so it
+    # never moves a skill level; a resume turn counts for the skill it shows.
+    kind: Literal["intro", "resume", "skill"] = "skill"
     skill: str
     difficulty: int = Field(..., ge=1, le=5)
     question: str
@@ -140,7 +145,9 @@ class CoachState(BaseModel):
     role_skills: List[RoleSkill] = Field(default_factory=list)
     jd_text: str = ""
     target_readiness: float = 90
-    interview_turns: int = 6  # main questions in the final interview; follow-ups are extra
+    # Main questions in the final interview, the intro and resume questions
+    # included; follow-ups are extra.
+    interview_turns: int = 8
 
     # --- diagnosis ---
     skills: List[SkillLevel] = Field(default_factory=list)
@@ -160,6 +167,8 @@ class CoachState(BaseModel):
     interview: List[InterviewTurn] = Field(default_factory=list)
     # Set when the candidate ends the interview before its last question.
     interview_ended: bool = False
+    # Earlier attempts when the interview is retaken, oldest first.
+    past_interviews: List[List[InterviewTurn]] = Field(default_factory=list)
 
     # --- output ---
     # Sessions are a single pass, so this stays 0; kept for saved sessions and

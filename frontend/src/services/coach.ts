@@ -37,7 +37,11 @@ export interface SkillTopics { skill: string; resources?: Resource[]; topics: To
 
 export interface RubricScore { correctness: number; depth: number; communication: number }
 
+/** intro = "introduce yourself"; resume = on a project or achievement from the resume; skill = on a role skill */
+export type TurnKind = 'intro' | 'resume' | 'skill';
+
 export interface InterviewTurn {
+  kind?: TurnKind;
   skill: string;
   difficulty: number;
   question: string;
@@ -89,6 +93,8 @@ export interface CoachState {
   checkpoint_queue: string[];
   checkpoints: CheckpointResult[];
   interview: InterviewTurn[];
+  /** earlier attempts when the interview was retaken, oldest first */
+  past_interviews?: InterviewTurn[][];
   cycle: number;
   history: ReadinessSnapshot[];
   summary: string;
@@ -125,6 +131,7 @@ export interface InterviewPrompt {
   skill: string;
   difficulty: number;
   is_follow_up: boolean;
+  kind?: TurnKind;
   question: string;
   /** page the question is based on; empty when the coach wrote it */
   source_name: string;
@@ -152,7 +159,7 @@ export interface ProgressRow {
 
 export interface RespondPayload {
   answers?: number[];
-  action?: 'assess' | 'retake' | 'interview' | 'finish' | 'skip' | 'skip_all' | 'switch' | 'end';
+  action?: 'assess' | 'retake' | 'interview' | 'retake_interview' | 'finish' | 'skip' | 'skip_all' | 'switch' | 'end';
   skill?: string;
   answer?: string;
   voice_metrics?: Record<string, number>;

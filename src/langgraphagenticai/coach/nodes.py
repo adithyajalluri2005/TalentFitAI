@@ -104,6 +104,13 @@ class _Question(BaseModel):
     key_points: List[str] = Field(default_factory=list, description="2-5 points a strong answer covers. Leave empty only when asking a seed as-is or lightly reworded.")
 
 
+class _ResumeQuestion(BaseModel):
+    question: str
+    skill: str = Field(..., description="The role skill (exactly as listed) the project or achievement shows best.")
+    key_points: List[str] = Field(..., min_length=2, max_length=5,
+                                  description="2-5 points a strong answer covers, grounded in what the resume says.")
+
+
 class _Evaluation(BaseModel):
     score: RubricScore
     feedback: str = Field(..., description="Two or three sentences: what was good, what was missing.")
@@ -569,7 +576,7 @@ Return one entry per key, candidate ids exactly as shown (e.g. "t{si}.0.2"), bes
             "pending": list(state.checkpoint_queue),
             "retakeable": self.retakeable(state),
             "interview_done": done,
-            "accepts": {"action": "'assess' | 'retake' (with skill) | 'finish'" if done
+            "accepts": {"action": "'assess' | 'retake' (with skill) | 'retake_interview' | 'finish'" if done
                         else "'assess' | 'retake' (with skill) | 'interview' | 'skip_all'"},
         }) or {}
         action, target = reply.get("action"), reply.get("skill")
@@ -578,6 +585,11 @@ Return one entry per key, candidate ids exactly as shown (e.g. "t{si}.0.2"), bes
                     "switch_to": target}
         if action == "retake" and target in self.retakeable(state):
             return {"checkpoint_queue": [target] + list(state.checkpoint_queue), "switch_to": target}
+        if done and action == "retake_interview":
+            # A fresh interview; the last one is kept for review and its
+            # questions are not asked again.
+            return {"past_interviews": state.past_interviews + [state.interview], "interview": [],
+                    "interview_ended": False, "status": "interviewing", "skip_checkpoints": True}
         if done:
             return {"closed": True} if action == "finish" else {}
         if action == "skip_all" or (action == "interview" and not state.checkpoint_queue):
@@ -710,6 +722,21 @@ explanation says briefly why it is correct.{avoid}
     # before the model asks without seeds.
     INTERVIEW_WEB_WAIT = 25
 
+    # Main questions that are not on a role skill, by position: the interview
+    # opens with "introduce yourself"; questions 2 and 5 are on the resume
+    # (a project, then an achievement or another project).
+    INTRO_TURN = 0
+    RESUME_TURNS = (1, 4)
+    INTRO_QUESTION = ("Let's begin. Please introduce yourself: your background, a project or achievement you are "
+                      "proud of, and why you are interested in this {role} role.")
+
+    def _turn_kind(self, state: CoachState, main_index: int) -> str:
+        if main_index == self.INTRO_TURN:
+            return "intro"
+        if main_index in self.RESUME_TURNS and state.resume_text.strip():
+            return "resume"
+        return "skill"
+
     @staticmethod
     def _next_skill(skills: List[SkillLevel], asked: Dict[str, int]) -> SkillLevel:
         # Highest-priority skill, rotated so one weak skill does not take every turn.
@@ -718,7 +745,9 @@ explanation says briefly why it is correct.{avoid}
     def _interview_skills(self, state: CoachState) -> List[str]:
         """The skills the main interview questions will be on, in order."""
         asked: Dict[str, int] = {}
-        for _ in range(state.interview_turns):
+        for i in range(state.interview_turns):
+            if self._turn_kind(state, i) != "skill":
+                continue
             s = self._next_skill(state.skills, asked).skill
             asked[s] = asked.get(s, 0) + 1
         return list(asked)
@@ -735,8 +764,24 @@ explanation says briefly why it is correct.{avoid}
             except Exception as e:  # questions then come from the model; never fail the interview for it
                 logger.warning("web question prefetch failed: %s", e)
 
-        if last and last.needs_follow_up and not last.is_follow_up:
-            skill, follow_up = _skill(state, last.skill), True
+        main = sum(1 for t in turns if not t.is_follow_up)
+        kind = "skill"
+        if last and last.needs_follow_up and not last.is_follow_up and last.kind != "intro":
+            follow_up, kind = True, last.kind
+            skill = next((s for s in state.skills if s.skill == last.skill), None)
+            if skill is None:  # a resume turn on no role skill
+                skill = SkillLevel(skill=last.skill, required_level=3, jd_weight=0.0, level=2)
+        elif self._turn_kind(state, main) == "intro":
+            # Fixed opening question: no model call, so the interview starts at once.
+            return {"interview": turns + [InterviewTurn(
+                kind="intro", skill="Introduction", difficulty=1,
+                question=self.INTRO_QUESTION.format(role=state.target_role or "target"),
+                key_points=["Brief background: education or current role",
+                            "One or two relevant projects or achievements, with their own contribution",
+                            "Skills that match the role", "Why this role"],
+            )], "status": "interviewing"}
+        elif self._turn_kind(state, main) == "resume":
+            return {"interview": turns + [self._resume_turn(state)], "status": "interviewing"}
         else:
             asked = {t.skill: 0 for t in turns}
             for t in turns:
@@ -758,7 +803,8 @@ Probe the specific weak point; do not repeat the question."""
                 # keep the candidate waiting mid-interview.
                 wait = 0 if turns else self.INTERVIEW_WEB_WAIT
                 web = self.web_questions.harvest(skill.skill, self._ask, wait=wait)[0]
-                seeds = pick_seeds(web, skill.skill, difficulty, used_ids=[t.bank_id for t in state.interview])
+                seeds = pick_seeds(web, skill.skill, difficulty,
+                                   used_ids=[t.bank_id for t in self._all_turns(state) if t.bank_id])
         if seeds:
             context = (f"SEED QUESTIONS from interview-prep sites. Build your question on ONE of them and set seed to its number.\n"
                        f"- Seed at difficulty {difficulty} or above: ask it as-is or lightly reworded, and leave key_points empty.\n"
@@ -774,19 +820,55 @@ Ask ONE spoken-interview question on {skill.skill} at difficulty {difficulty}/5
 (1 = definitions, 3 = applied scenario, 5 = design trade-offs under constraints).
 It must be answerable verbally in about two minutes. Prefer scenarios over trivia.
 {context}
-Questions already asked (do not repeat): {[t.question for t in turns]}
+{self._resume_note(state) if kind == "resume" else ""}
+Questions already asked (do not repeat): {[t.question for t in self._all_turns(state)]}
 """)
         seed = seeds[q.seed] if 0 <= q.seed < len(seeds) else None
         # A seed raised to a harder version comes with its own key points; the
         # seed's page still explains the concept, so its source link is kept.
         raised = bool(seed and q.key_points)
         turn = InterviewTurn(
-            skill=skill.skill, difficulty=difficulty if (raised or not seed) else seed.difficulty,
+            kind=kind, skill=skill.skill, difficulty=difficulty if (raised or not seed) else seed.difficulty,
             question=q.question, is_follow_up=follow_up, bank_id=seed.id if seed else "",
             key_points=q.key_points[:5] if (raised or not seed) else seed.key_points,
             source_name=seed.source_name if seed else "", source_url=seed.source_url if seed else "",
         )
         return {"interview": state.interview + [turn], "status": "interviewing"}
+
+    @staticmethod
+    def _all_turns(state: CoachState) -> List[InterviewTurn]:
+        """This interview's turns and those of earlier attempts."""
+        return [t for past in state.past_interviews for t in past] + list(state.interview)
+
+    @staticmethod
+    def _resume_note(state: CoachState) -> str:
+        return f"CANDIDATE'S RESUME (questions and scoring must stay grounded in it):\n{state.resume_text[:4000]}"
+
+    def _resume_turn(self, state: CoachState) -> InterviewTurn:
+        """A question on a project, internship or achievement from the resume,
+        probing the candidate's own part in it."""
+        earlier = [t.question for t in self._all_turns(state) if t.kind == "resume"]
+        here = [t for t in state.interview if t.kind == "resume"]
+        focus = ("one of their PROJECTS (the most relevant to the role)" if not here else
+                 "an ACHIEVEMENT, internship, certification or a different project not yet discussed")
+        names = [s.skill for s in state.skills]
+        q = self._ask(_ResumeQuestion, f"""
+You are interviewing a candidate for: {state.target_role}.
+Ask ONE spoken-interview question about {focus} from their resume below. Name it specifically.
+Probe what THEY did: their role, a key technical decision and why, a problem they hit, and the result
+(with numbers if the resume gives any). Answerable verbally in about two minutes. No yes/no questions.
+skill: the role skill it shows best, exactly one of: {names}
+key_points: what a strong answer covers, grounded in what the resume says.
+
+{self._resume_note(state)}
+
+Questions already asked (do not repeat or ask about the same item): {earlier + [t.question for t in state.interview]}
+""")
+        m = difflib.get_close_matches(q.skill.lower(), [n.lower() for n in names], n=1, cutoff=0.5)
+        skill = next((n for n in names if m and n.lower() == m[0]), "Resume")
+        level = next((s.level for s in state.skills if s.skill == skill), 2)
+        return InterviewTurn(kind="resume", skill=skill, difficulty=max(1, min(5, round(level) + 1)),
+                             question=q.question, key_points=q.key_points[:5], source_name="Your resume")
 
     def await_answer(self, state: CoachState) -> dict:
         turn = state.interview[-1]
@@ -798,6 +880,7 @@ Questions already asked (do not repeat): {[t.question for t in turns]}
             "skill": turn.skill,
             "difficulty": turn.difficulty,
             "is_follow_up": turn.is_follow_up,
+            "kind": turn.kind,
             "question": turn.question,
             "source_name": turn.source_name,
             "source_url": turn.source_url,
@@ -847,17 +930,30 @@ Questions already asked (do not repeat): {[t.question for t in turns]}
                              feedback="Question skipped." if turn.answer == "SKIPPED" else "No answer given.",
                              needs_follow_up=False)
         else:
+            if turn.kind == "intro":
+                rubric = ('This is the opening "introduce yourself" question.\n'
+                          "correctness: accurate to and grounded in the resume below, and relevant to the role? "
+                          "depth: specific projects, achievements and impact rather than generic claims? "
+                          "communication: clear, structured, about a minute or two?\n" + self._resume_note(state))
+            elif turn.kind == "resume":
+                rubric = ("The question is on the candidate's own resume.\n"
+                          "correctness: technically sound and consistent with the resume? depth: their own contribution, "
+                          "decisions, trade-offs, results? communication: clear and structured?\n" + self._resume_note(state))
+            else:
+                rubric = ("correctness: is it technically right? depth: reasoning, trade-offs, examples? "
+                          "communication: clear and structured?")
             ev = self._ask(_Evaluation, f"""
 You are a fair, strict technical interviewer. Score this spoken answer (transcribed, so ignore
 transcription errors) on a 1-5 rubric for a difficulty-{turn.difficulty} question on {turn.skill}.
-correctness: is it technically right? depth: reasoning, trade-offs, examples? communication: clear and structured?
+{rubric}
 
 QUESTION: {turn.question}
 {self._key_points_note(turn)}
 ANSWER: {turn.answer}
 {self._voice_note(turn)}""")
         updated = turn.model_copy(update={
-            "score": ev.score, "feedback": ev.feedback, "needs_follow_up": ev.needs_follow_up,
+            # The opening question gets no follow-up: the interview moves on to the resume and skills.
+            "score": ev.score, "feedback": ev.feedback, "needs_follow_up": ev.needs_follow_up and turn.kind != "intro",
         })
         return {"interview": state.interview[:-1] + [updated]}
 

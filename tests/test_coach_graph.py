@@ -67,6 +67,9 @@ class FakeLLM:
             return schema(questions=[N._QuizItem(question=f"q{i}", options=["a", "b", "c", "d"], answer_index=0) for i in range(n)])
         if schema is N._Question:
             return N._Question(question=f"question {prompt.count('FOLLOW-UP')}")
+        if schema is N._ResumeQuestion:
+            return N._ResumeQuestion(question="Walk me through your Flask API project.", skill="python",
+                                     key_points=["own role", "design decision"])
         if schema is N._Evaluation:
             good = "ANSWER: good" in prompt
             s = 5 if good else 2
@@ -83,10 +86,16 @@ def _state(**kw):
     return CoachState(candidate_id="c1", resume_text="resume", jd_text="jd", interview_turns=3, **kw)
 
 
+def skill_only(nodes: CoachNodes) -> CoachNodes:
+    """Only role-skill questions: no opening intro, no resume questions."""
+    nodes.INTRO_TURN, nodes.RESUME_TURNS = None, ()
+    return nodes
+
+
 def test_session_is_single_pass_with_retakes_and_records_history():
     snapshots = []
     llm = FakeLLM()
-    coach = CoachGraph(CoachNodes(llm, on_snapshot=lambda s, t, snap: snapshots.append((t, snap))))
+    coach = CoachGraph(skill_only(CoachNodes(llm, on_snapshot=lambda s, t, snap: snapshots.append((t, snap)))))
     view = coach.start("t1", _state(target_readiness=85))
     # Diagnosis + plan only: no quiz is written until the candidate asks for one.
     assert view["waiting_for"] == {"type": "study", "pending": ["Docker", "SQL"], "retakeable": [], "interview_done": False,   # highest weight x gap first
@@ -162,7 +171,7 @@ def test_session_is_single_pass_with_retakes_and_records_history():
 
 
 def test_respond_when_not_waiting_raises():
-    coach = CoachGraph(CoachNodes(FakeLLM()))
+    coach = CoachGraph(skill_only(CoachNodes(FakeLLM())))
     coach.start("t2", _state())
     coach.respond("t2", {"action": "skip_all"})
     for _ in range(6):                                          # 3 weak answers, each followed up
@@ -180,7 +189,7 @@ def test_respond_when_not_waiting_raises():
 
 
 def test_skip_interview_question():
-    coach = CoachGraph(CoachNodes(FakeLLM()))
+    coach = CoachGraph(skill_only(CoachNodes(FakeLLM())))
     coach.start("t8", _state())
     view = coach.respond("t8", {"action": "skip_all"})
     assert view["waiting_for"]["type"] == "interview_question"
@@ -200,7 +209,7 @@ def test_skip_interview_question():
 
 
 def test_end_interview_early():
-    coach = CoachGraph(CoachNodes(FakeLLM()))
+    coach = CoachGraph(skill_only(CoachNodes(FakeLLM())))
     coach.start("t9", _state())
     coach.respond("t9", {"action": "skip_all"})
     view = coach.respond("t9", {"answer": "good answer"})
@@ -210,6 +219,56 @@ def test_end_interview_early():
     assert view["state"]["status"] in ("ready", "finished")
     assert [t["answer"] for t in view["state"]["interview"]] == ["good answer"]
     assert len(view["state"]["history"]) == 1 and view["state"]["summary"]
+
+
+def test_interview_opens_with_intro_then_asks_on_the_resume():
+    llm = FakeLLM()
+    coach = CoachGraph(CoachNodes(llm))
+    coach.start("t11", CoachState(candidate_id="c1", resume_text="resume", jd_text="jd", interview_turns=6))
+    view = coach.respond("t11", {"action": "skip_all"})
+    w = view["waiting_for"]
+    assert w["kind"] == "intro" and w["turn"] == 1 and w["of"] == 6
+    assert "introduce yourself" in w["question"].lower()
+    assert "_Question" not in llm.calls and "_ResumeQuestion" not in llm.calls   # no model call for the intro
+    skills_before = {s["skill"]: s["level"] for s in view["state"]["skills"]}
+
+    # A weak intro gets no follow-up; question 2 is on the resume, tied to a role skill.
+    view = coach.respond("t11", {"answer": "meh"})
+    w = view["waiting_for"]
+    assert w["kind"] == "resume" and w["turn"] == 2 and not w["is_follow_up"]
+    assert w["skill"] == "Python" and w["source_name"] == "Your resume" and "Flask" in w["question"]
+    # A weak resume answer is followed up on the same item.
+    view = coach.respond("t11", {"answer": "meh"})
+    assert view["waiting_for"]["is_follow_up"] and view["waiting_for"]["kind"] == "resume"
+    view = coach.respond("t11", {"answer": "good answer"})
+    assert view["waiting_for"]["kind"] == "skill" and view["waiting_for"]["turn"] == 3
+    view = coach.respond("t11", {"action": "end"})
+
+    # The intro is scored but is not a role skill: no skill gets an observation from it.
+    intro = view["state"]["interview"][0]
+    assert intro["kind"] == "intro" and intro["skill"] == "Introduction" and intro["score"]
+    for s in view["state"]["skills"]:
+        assert all("Introduction" not in o["note"] for o in s["observations"])
+    python = next(s for s in view["state"]["skills"] if s["skill"] == "Python")
+    assert sum(o["source"] == "interview" for o in python["observations"]) == 2   # resume question + follow-up
+    assert set(skills_before) == {s["skill"] for s in view["state"]["skills"]}
+
+
+def test_interview_can_be_retaken_after_it_is_done():
+    coach = CoachGraph(skill_only(CoachNodes(FakeLLM())))
+    coach.start("t12", CoachState(candidate_id="c1", resume_text="resume", jd_text="jd", interview_turns=1))
+    coach.respond("t12", {"action": "skip_all"})
+    view = coach.respond("t12", {"answer": "good answer"})
+    assert view["waiting_for"]["type"] == "study" and view["waiting_for"]["interview_done"]
+    first = view["state"]["interview"]
+
+    view = coach.respond("t12", {"action": "retake_interview"})
+    assert view["waiting_for"]["type"] == "interview_question" and view["waiting_for"]["turn"] == 1
+    assert view["state"]["interview"][0]["answer"] is None
+    assert view["state"]["past_interviews"] == [first]
+    view = coach.respond("t12", {"answer": "good answer"})
+    assert view["waiting_for"]["type"] == "study" and view["waiting_for"]["interview_done"]
+    assert len(view["state"]["history"]) == 2                    # re-scored after each interview
 
 
 def test_end_interview_before_any_answer():

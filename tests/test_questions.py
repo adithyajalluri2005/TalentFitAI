@@ -46,6 +46,12 @@ class RecordingLLM:
         return Chain()
 
 
+def _skill_only(nodes):
+    """Only role-skill questions: no opening intro, no resume questions."""
+    nodes.INTRO_TURN, nodes.RESUME_TURNS = None, ()
+    return nodes
+
+
 def _state(**kw):
     return CoachState(candidate_id="c", resume_text="r", target_role="Backend Dev", interview_turns=3,
                       skills=[SkillLevel(skill="SQL", required_level=3, jd_weight=1.0, level=2)], **kw)
@@ -75,7 +81,7 @@ def test_ids_are_stable():
 def test_interview_asks_from_seed_and_grades_against_its_key_points():
     llm = RecordingLLM(lambda schema, p: N._Question(question="adapted", seed=1) if schema is N._Question else
                        N._Evaluation(score=RubricScore(correctness=3, depth=3, communication=3), feedback="f", needs_follow_up=False))
-    nodes = CoachNodes(llm, web_questions=FakeWeb(QUESTIONS))
+    nodes = _skill_only(CoachNodes(llm, web_questions=FakeWeb(QUESTIONS)))
     state = _state()
 
     turn = nodes.interview_ask(state)["interview"][-1]
@@ -95,13 +101,13 @@ def test_interview_asks_from_seed_and_grades_against_its_key_points():
 
 def test_without_web_questions_the_model_writes_key_points_and_no_source():
     llm = RecordingLLM(lambda schema, p: N._Question(question="q", key_points=["x", "y"]))
-    turn = CoachNodes(llm, web_questions=FakeWeb()).interview_ask(_state())["interview"][-1]
+    turn = _skill_only(CoachNodes(llm, web_questions=FakeWeb())).interview_ask(_state())["interview"][-1]
     assert "SEED" not in llm.prompts[-1] and "key_points" in llm.prompts[-1]
     assert turn.bank_id == "" and turn.key_points == ["x", "y"] and turn.source_url == ""
 
     # A seed number out of range is ignored rather than trusted.
     llm = RecordingLLM(lambda schema, p: N._Question(question="q", seed=7, key_points=["m", "n"]))
-    turn = CoachNodes(llm, web_questions=FakeWeb(QUESTIONS)).interview_ask(_state())["interview"][-1]
+    turn = _skill_only(CoachNodes(llm, web_questions=FakeWeb(QUESTIONS))).interview_ask(_state())["interview"][-1]
     assert turn.bank_id == "" and turn.key_points == ["m", "n"] and turn.difficulty == 3
 
 
@@ -228,7 +234,7 @@ def test_too_easy_seed_is_raised_keeping_its_source():
     llm = RecordingLLM(lambda schema, p: N._Question(question="harder version", seed=0, key_points=["k1", "k2", "k3"]))
     state = CoachState(candidate_id="c", resume_text="r", target_role="Dev", interview_turns=3,   # needs difficulty 5
                        skills=[SkillLevel(skill="SQL", required_level=5, jd_weight=1.0, level=4)])
-    turn = CoachNodes(llm, web_questions=FakeWeb([_q("sql-1", 1), _q("sql-2", 2)])).interview_ask(state)["interview"][-1]
+    turn = _skill_only(CoachNodes(llm, web_questions=FakeWeb([_q("sql-1", 1), _q("sql-2", 2)]))).interview_ask(state)["interview"][-1]
     assert "raise it to 5" in llm.prompts[-1]
     assert turn.bank_id == "sql-2" and turn.difficulty == 5 and turn.key_points == ["k1", "k2", "k3"]
     assert turn.source_url.endswith("/sql-2/")                               # concept page still linked
@@ -279,7 +285,7 @@ def test_plan_starts_question_retrieval_for_its_skills():
 def test_interview_start_retrieves_questions_for_its_skills():
     from test_coach_graph import FakeLLM
     web = FakeWeb()
-    nodes = CoachNodes(FakeLLM(), web_questions=web)
+    nodes = _skill_only(CoachNodes(FakeLLM(), web_questions=web))
     state = _three_skill_state()
     out = nodes.interview_ask(state)
     assert web.prefetched == ["Docker", "SQL"]               # only skills the interview will ask about

@@ -1,6 +1,7 @@
+import axios from 'axios';
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { CheckCircle2, Loader2, RotateCcw, Trophy, TrendingUp, XCircle } from 'lucide-react';
+import { CheckCircle2, Loader2, Mic, RotateCcw, Trophy, TrendingUp, XCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -74,7 +75,7 @@ export default function Session() {
   const respond = useCallback(async (payload: RespondPayload) => {
     // Starting the interview (also "skip to interview" from an assessment):
     // show the interview tab's loading state, not "Preparing your assessment".
-    const opensInterview = payload.action === 'interview' || payload.action === 'skip_all';
+    const opensInterview = payload.action === 'interview' || payload.action === 'skip_all' || payload.action === 'retake_interview';
     if (opensInterview && tab !== 'interview') navigate(`/session/${threadId}/interview`);
     setStartingInterview(opensInterview);
     setBusy(true);
@@ -93,7 +94,10 @@ export default function Session() {
       if (target !== (opensInterview ? 'interview' : tab)) navigate(`/session/${threadId}/${target}`);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (e) {
-      toast({ title: 'Something went wrong', description: errorMessage(e), variant: 'destructive' });
+      // The server no longer has this session (restarted or redeployed): say
+      // so on the page with a way forward, not in a toast that vanishes.
+      if (axios.isAxiosError(e) && e.response?.status === 404) setLoadError(errorMessage(e));
+      else toast({ title: 'Something went wrong', description: errorMessage(e), variant: 'destructive' });
     } finally {
       setBusy(false);
       setStartingInterview(false);
@@ -128,6 +132,8 @@ export default function Session() {
   const interviewDone = state.status === 'ready' || state.status === 'finished';
   const showRecap = !!lastSnapshot && (view.done || interviewDone);
   const finish = () => respond({ action: 'finish' });
+  // After the interview: a fresh one, with new questions; the last one stays in the review.
+  const retakeInterview = () => respond({ action: 'retake_interview' });
   const goTo = (t: Tab) => navigate(`/session/${threadId}/${t}`);
   const topicsFor = (skill: string) => state.plan.find((p) => p.skill === skill)?.topics.length ?? 0;
   // Open this skill's assessment. Quizzes are only written on request, so this
@@ -183,7 +189,7 @@ export default function Session() {
 
         {tab === 'plan' && (
           <>
-            {showRecap && <SessionRecap view={view} onRetake={view.done ? undefined : () => goTo('checkpoints')} onFinish={view.done ? undefined : finish} />}
+            {showRecap && <SessionRecap view={view} onRetake={view.done ? undefined : () => goTo('checkpoints')} onRetakeInterview={view.done ? undefined : retakeInterview} onFinish={view.done ? undefined : finish} />}
             {refreshing ? (
               <Card><CardContent className="py-16 flex flex-col items-center gap-3 text-muted-foreground text-sm">
                 <Loader2 className="h-6 w-6 animate-spin text-primary" />
@@ -255,7 +261,7 @@ export default function Session() {
               <InterviewRoom prompt={waiting} onSubmit={respond} busy={busy} />
             </>
           ) : busy ? thinking : showRecap ? (
-            <SessionRecap view={view} reviewOpen onRetake={view.done ? undefined : () => goTo('checkpoints')} onFinish={view.done ? undefined : finish} />
+            <SessionRecap view={view} reviewOpen onRetake={view.done ? undefined : () => goTo('checkpoints')} onRetakeInterview={view.done ? undefined : retakeInterview} onFinish={view.done ? undefined : finish} />
           ) : waiting?.type === 'study' && waiting.pending.length === 0 ? (
             <Placeholder
               text="Every skill assessment is done. Start the final interview when you're ready; until then you can still retake assessments."
@@ -436,11 +442,12 @@ function KeyPoints({ points }: { points: string[] }) {
 
 // ---------------- end of session ----------------
 
-function SessionRecap({ view, reviewOpen = false, onRetake, onFinish }: {
+function SessionRecap({ view, reviewOpen = false, onRetake, onRetakeInterview, onFinish }: {
   view: SessionView;
   reviewOpen?: boolean;
   /** shown while the session is open: assessments can still be retaken after the interview */
   onRetake?: () => void;
+  onRetakeInterview?: () => void;
   onFinish?: () => void;
 }) {
   const { state } = view;
@@ -476,7 +483,9 @@ function SessionRecap({ view, reviewOpen = false, onRetake, onFinish }: {
                 <div key={i} className="space-y-1.5 rounded-lg border p-3">
                   <div className="flex flex-wrap items-center gap-2 text-xs">
                     <Badge variant="secondary">Q{i + 1}</Badge>
-                    <span className="text-muted-foreground">{t.skill}{t.is_follow_up ? ' · follow-up' : ''}</span>
+                    <span className="text-muted-foreground">
+                      {t.kind === 'resume' ? `Your resume · ${t.skill}` : t.skill}{t.is_follow_up ? ' · follow-up' : ''}
+                    </span>
                     {t.score && (
                       <Badge variant="outline" className={cn('ml-auto tabular-nums',
                         avgScore(t.score) >= 3.5 ? 'text-success' : avgScore(t.score) >= 2.5 ? 'text-warning' : 'text-destructive')}>
@@ -494,15 +503,18 @@ function SessionRecap({ view, reviewOpen = false, onRetake, onFinish }: {
                   <p>{t.feedback}</p>
                   {t.critic_note && <p className="text-xs text-muted-foreground">Score reviewed: {t.critic_note}</p>}
                   <KeyPoints points={t.key_points} />
-                  <SourceLink name={t.source_name} url={t.source_url} label="Learn the answer" />
+                  {t.kind !== 'intro' && t.kind !== 'resume' && <SourceLink name={t.source_name} url={t.source_url} label="Learn the answer" />}
                 </div>
               ))}
             </div>
           </details>
         )}
         <div className="flex flex-wrap gap-2">
+          {onRetakeInterview && (
+            <Button onClick={onRetakeInterview}><Mic className="h-4 w-4 mr-1.5" /> Retake interview</Button>
+          )}
           {onRetake && (
-            <Button onClick={onRetake}><RotateCcw className="h-4 w-4 mr-1.5" /> Retake assessments to improve</Button>
+            <Button variant={onRetakeInterview ? 'outline' : 'default'} onClick={onRetake}><RotateCcw className="h-4 w-4 mr-1.5" /> Retake assessments to improve</Button>
           )}
           {onFinish && <Button variant="outline" onClick={onFinish}>End session</Button>}
           <Button asChild variant="outline"><Link to="/start">Start another session</Link></Button>

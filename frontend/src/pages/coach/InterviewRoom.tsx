@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Bot, Clock, Eye, EyeOff, Gauge, Loader2, MessageSquareText, Mic, MicOff, RotateCcw, Send, SkipForward,
   Sparkles, Square, VideoOff, CircleStop,
+  FileText,
 } from 'lucide-react';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
@@ -342,7 +343,13 @@ export default function InterviewRoom({ prompt, onSubmit, busy = false }: {
             <div className="min-w-0 flex-1 space-y-1">
               <p className="text-base sm:text-lg font-semibold leading-snug">{prompt.question}</p>
               {!prompt.is_follow_up && (
-                <SourceLink name={prompt.source_name} url={prompt.source_url} label="Question based on" tone="dark" />
+                prompt.kind === 'intro' || prompt.kind === 'resume' ? (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-800/80 px-2.5 py-1 text-[11px] text-slate-300">
+                    <FileText className="h-3 w-3" /> {prompt.kind === 'intro' ? 'Opening question' : 'Based on your resume'}
+                  </span>
+                ) : (
+                  <SourceLink name={prompt.source_name} url={prompt.source_url} label="Question based on" tone="dark" />
+                )
               )}
             </div>
           </div>

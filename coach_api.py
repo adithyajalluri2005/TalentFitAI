@@ -30,6 +30,11 @@ from src.langgraphagenticai.coach.state import CoachState
 from src.langgraphagenticai.coach.store import ProgressStore, TopicStore
 
 
+# Sessions live in the server's SQLite file; on hosts without a persistent
+# disk (Render free plan) a restart or redeploy loses them.
+SESSION_LOST = ("Session not found. It was probably lost when the server restarted or was updated. "
+                "Please start a new session.")
+
 FILLER_WORDS = re.compile(r"\b(um+|uh+|erm|hmm+|like|you know|basically|actually|i mean|sort of|kind of)\b", re.I)
 
 
@@ -191,7 +196,7 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
     def respond(thread_id: str, payload: RespondPayload) -> Dict[str, Any]:
         current = coach.view(thread_id)
         if current is None:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(status_code=404, detail=SESSION_LOST)
         if payload.action in ("assess", "switch"):
             pending = (current["waiting_for"] or {}).get("pending", [])
             if payload.skill not in pending:
@@ -210,7 +215,7 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
     def refresh_plan(thread_id: str) -> Dict[str, Any]:
         view = coach.view(thread_id)
         if view is None:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(status_code=404, detail=SESSION_LOST)
         if view["done"]:
             raise HTTPException(status_code=409, detail="Session is finished")
         try:
@@ -223,7 +228,7 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
         """Mark a study topic done/undone. Returns the ticked topics for the cycle."""
         view = coach.view(thread_id)
         if view is None:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(status_code=404, detail=SESSION_LOST)
         plan = {p["skill"]: p for p in view["state"]["plan"]}
         if tick.skill not in plan or not 0 <= tick.topic_index < len(plan[tick.skill]["topics"]):
             raise HTTPException(status_code=422, detail="Unknown skill or topic")
@@ -235,7 +240,7 @@ def build_coach_router(llm, db_path: str, fallback_llm=None) -> APIRouter:
     def get_session(thread_id: str):
         view = coach.view(thread_id)
         if view is None:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(status_code=404, detail=SESSION_LOST)
         return with_topics(view)
 
     return router

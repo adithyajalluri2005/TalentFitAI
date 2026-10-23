@@ -132,6 +132,7 @@ def test_coach_uses_web_questions_with_sources(tmp_path):
     # The two pages give 6 verified questions: enough for a quiz of sourced questions only.
     assert len(quiz) == 6 and all(q.source_url in (GFG, IB) for q in quiz)
 
+    nodes.INTRO_TURN, nodes.RESUME_TURNS = None, ()          # straight to a skill question
     turn = nodes.interview_ask(_state())["interview"][-1]
     assert turn.source_url in (GFG, IB) and turn.key_points == ["unique per row", "not NULL"]
 
